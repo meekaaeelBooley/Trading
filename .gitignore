@@ -1,0 +1,19 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# credentials and local config
+.env
+.env.*
+*.pem
+*.key
+secrets*
+.mcp.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# runtime trading state (journal, positions, calendar cache, KILL/HALT) and bulk market data
+state/
+data/

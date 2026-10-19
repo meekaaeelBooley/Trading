@@ -1,0 +1,34 @@
+{
+  "model": "claude-sonnet-5-5",
+  "permissions": {
+    "allow": [
+      "mcp__mt5__session_tick",
+      "mcp__mt5__place_trade_checked",
+      "mcp__mt5__journal_pass",
+      "mcp__mt5__flatten_all",
+      "mcp__mt5__session_summary",
+      "mcp__mt5__review",
+      "mcp__mt5__set_lessons",
+      "mcp__mt5__propose_change",
+      "mcp__mt5__annotate_trade",
+      "mcp__mt5__refresh_calendar",
+      "mcp__mt5__set_risk_flag",
+      "mcp__mt5__deep_review",
+      "mcp__mt5__health_report",
+      "mcp__mt5__account_info",
+      "mcp__mt5__get_price",
+      "mcp__mt5__positions",
+      "mcp__mt5__get_rates",
+      "WebSearch"
+    ],
+    "deny": [
+      "mcp__mt5__place_order",
+      "mcp__mt5__modify_position",
+      "mcp__mt5__cancel_order",
+      "Edit(config.json)",
+      "Edit(state/**)",
+      "Write(config.json)",
+      "Write(state/**)"
+    ]
+  }
+}

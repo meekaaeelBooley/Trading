@@ -1,0 +1,4 @@
+MetaTrader5
+mcp[cli]<2
+numpy
+pytest
