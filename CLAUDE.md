@@ -49,3 +49,21 @@ Do not compute indicators, lot sizes, or read candles. Be terse: one-line status
 - Demo → live gate: ≥100 trades, expectancy > 0, PF > 1.2, max DD < 20% — report it, never act on it.
 - Dry run: start the server with env `DRY_RUN=1` to log trades without sending them.
 - Tests: `.venv\Scripts\python.exe -m pytest -q`.
+
+## Experiment mode (headless, 5-minute, USTECm + XAUUSDm, demo only)
+- `tools/run_experiment.ps1` (add `-DryRun` to rehearse) opens two no-LLM runners: `config.exp-ustec.json` / `config.exp-xau.json`
+  with their own state dirs `state-exp-ustec` / `state-exp-xau` (journal, run state, KILL/HALT). Signals on M5 closes
+  (`tf_min`: 5), strategies `pullback` + `orb` (opening-range breakout from 09:30 New York), 5% risk, 12% daily stop, 25% weekly halt.
+- Never run it together with `/loop /session` on USTECm. The default `config.json` and `state/` are untouched.
+- Learning is automatic: `reports/learn-<instance>.md` every 10 closed trades (lessons written only from buckets with n>=20;
+  candidate filters at n>=30 are proposals for the user). `tools/summary.py` shows per-symbol and combined results.
+- Evidence status: `reports/research-20261022-1745.md` found no confirmed edge on M5 data; the M5 pullback has no backtest. Treat results as an experiment.
+
+## AI mode (Claude analyses and decides; `/loop /ai`, USTECm + XAUUSDm, demo only)
+- Servers `mt5_ustec` / `mt5_xau` (same code as `mt5`, configs `config.exp-*.json`, state `state-exp-*`). The command `.claude/commands/ai.md` is the playbook.
+- You may originate trades with `open_trade(side, sl, tp, setup, thesis, risk_mult)` and manage them with `adjust_position`
+  (tighten_sl / partial / close). Python still enforces every gate, stop placement (0.5-3 ATR, right side), min reward:risk,
+  risk sizing (risk_mult only scales down), margin and fill verification. The hard rules above still apply: no `place_order`/
+  `modify_position`/`cancel_order`/`close_position`, stops never widened, gates/KILL/HALT never overridden.
+- Every AI trade is journaled with setup tag (`ai-<setup>`) and thesis; the review buckets by pattern so AI setups are learned per type.
+- Not together with `tools/run_experiment.ps1` (headless rules) on the same symbols.

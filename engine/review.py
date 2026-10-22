@@ -10,6 +10,20 @@ ATR_BANDS = [(0, 45, "atr<45"), (45, 70, "atr45-70"), (70, 1e9, "atr>70")]
 SPREAD_BANDS = [(0, 130, "spr<130"), (130, 170, "spr130-170"), (170, 1e9, "spr>170")]
 
 
+def configure_bands(cfg):
+    """Override the ATR / spread bucket edges in place (instrument-specific scales) from cfg atr_bands/spread_bands:
+    ascending edges, e.g. [8, 15] -> atr<8, atr8-15, atr>15."""
+    for key, target, prefix in (("atr_bands", ATR_BANDS, "atr"), ("spread_bands", SPREAD_BANDS, "spr")):
+        e = cfg.get(key)
+        if e:
+            lo, out = 0, []
+            for x in e:
+                out.append((lo, x, f"{prefix}<{x}" if lo == 0 else f"{prefix}{lo}-{x}"))
+                lo = x
+            out.append((lo, 1e9, f"{prefix}>{lo}"))
+            target[:] = out
+
+
 def band(v, bands):
     if v is None:
         return "n/a"

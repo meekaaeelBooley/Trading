@@ -16,4 +16,5 @@ secrets*
 
 # runtime trading state (journal, positions, calendar cache, KILL/HALT) and bulk market data
 state/
+state-exp-*/
 data/

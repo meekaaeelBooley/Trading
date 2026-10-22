@@ -14,26 +14,35 @@ import MetaTrader5 as mt5
 from mcp.server.fastmcp import FastMCP
 
 from engine.defaults import DEFAULTS
-from engine import (clock, exits as ex_, filters as flt, gates, health, indicators as ind, journal as jr, news,
+from engine import (brief, clock, exits as ex_, filters as flt, gates, health, indicators as ind, journal as jr, news,
                     report, review as rv, risk, signal as sg)
 from engine.run import roll_state, start_or_continue  # noqa: F401  (re-exported; logic lives in engine/run.py)
 
 ROOT = Path(__file__).parent
-STATE_DIR = ROOT / "state"
+# Experiment instances run beside the default one: TRADING_CONFIG / TRADING_STATE select their own config file
+# and state directory (journal, run state, lessons), so symbols never share journals or run counters.
+CONFIG_F = ROOT / os.environ.get("TRADING_CONFIG", "config.json")
+STATE_DIR = ROOT / os.environ.get("TRADING_STATE", "state")
 STATE_F, JOURNAL_F, CAL_F = STATE_DIR / "state.json", STATE_DIR / "journal.jsonl", STATE_DIR / "calendar_cache.json"
 LESSONS_F, PROPOSALS_F = STATE_DIR / "lessons.md", STATE_DIR / "proposals.md"
 FILTERS_F, REPORTS_DIR = STATE_DIR / "filters.json", ROOT / "reports"
+TAG = STATE_DIR.name  # report-file prefix distinguishing instances
 REVIEW_EVERY, MAX_LESSONS = 10, 25  # new closed trades between reviews; cap on lesson lines
 TERMINAL_PATH = os.environ.get("MT5_PATH", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
 MAX_LOT = float(os.environ.get("MT5_MAX_LOT", "0.10"))  # cap for the manual place_order tool only
 DRY = os.environ.get("DRY_RUN") == "1"
+
+TF_MT5 = {5: mt5.TIMEFRAME_M5, 15: mt5.TIMEFRAME_M15}
 
 mcp = FastMCP("mt5")
 
 
 # ---------------------------------------------------------------- helpers
 def cfg():
-    return {**DEFAULTS, **json.loads((ROOT / "config.json").read_text())}
+    return {**DEFAULTS, **json.loads(CONFIG_F.read_text())}
+
+
+rv.configure_bands(cfg())
 
 
 def _ensure():
@@ -110,19 +119,20 @@ def snapshot(c):
     if tick is None or info is None:
         return {"ok": False}
     get = lambda tf: mt5.copy_rates_from_pos(sym, tf, 0, 320)
-    m15, h1, h4 = get(mt5.TIMEFRAME_M15), get(mt5.TIMEFRAME_H1), get(mt5.TIMEFRAME_H4)
+    tfm = int(c["tf_min"])
+    m15, h1, h4 = get(TF_MT5[tfm]), get(mt5.TIMEFRAME_H1), get(mt5.TIMEFRAME_H4)
     if any(x is None or len(x) < 120 for x in (m15, h1, h4)):
         return {"ok": False}
     closed = m15[:-1]
     bias = ind.bias(h1[:-1]["close"], h4[:-1]["close"])
     atr = ind.atr(closed["high"], closed["low"], closed["close"], 14)
-    sig, why = sg.find_signal(closed["open"], closed["high"], closed["low"], closed["close"], bias, c)
+    sig, why = sg.find_any(closed, bias, c)
     if sig:
         sig["id"] = f"{sym}-{int(closed[-1]['time'])}-{sig['side']}"
     return {"ok": True, "tick": tick, "info": info, "closed": closed, "bias": bias, "atr": atr, "signal": sig,
             "why": why, "spread": (tick.ask - tick.bid) / info.point,
             "market_open": abs(time.time() - tick.time) <= c["tick_stale_s"],
-            "data_fresh": int(m15[-1]["time"]) == int(tick.time) // 900 * 900}
+            "data_fresh": int(m15[-1]["time"]) == int(tick.time) // (tfm * 60) * (tfm * 60)}
 
 
 def reconcile(state, c):
@@ -148,7 +158,7 @@ def reconcile(state, c):
                               "mfe_r": mfe, "mae_r": mae,
                               "dur_min": None if t0 is None else round((deals[-1].time - t0) / 60),
                               "partial": bool(rec.get("partial_done")),
-                              **{k: rec.get(k) for k in ("side", "pattern", "bias", "atr", "spread", "hour", "regime")}})
+                              **{k: rec.get(k) for k in ("side", "pattern", "bias", "atr", "spread", "hour", "regime", "thesis")}})
         closed.append({"ticket": int(t), "r": r, "why": why})
         s = state["run"]
         # only a real loss extends the streak; BE/scratch exits (> -loss_threshold_r) reset nothing
@@ -354,7 +364,7 @@ def session_tick() -> dict:
             s["summarised"] = True
             try:
                 REPORTS_DIR.mkdir(exist_ok=True)
-                rp = REPORTS_DIR / f"run-{s['id']}.md"
+                rp = REPORTS_DIR / (f"run-{s['id']}.md" if TAG == "state" else f"run-{TAG}-{s['id']}.md")
                 rp.write_text(report.build(s, jr.read(JOURNAL_F), c["risk_pct"],
                                            health.check(jr.read(JOURNAL_F), c["spread_max_points"])), encoding="utf-8")
                 out["report"] = f"reports/{rp.name}"
@@ -404,7 +414,7 @@ def session_tick() -> dict:
     elif phase == "BREAK":
         wake = min(3600, ph["next_boundary_s"] + 5)
     else:
-        wake = clock.next_bar_close_s(now)
+        wake = clock.next_bar_close_s(now, c["tf_min"])
         if opens:
             wake = min(wake, 300)
             if ev and c["pre_event_exit"] and ev["in_s"] > c["pre_event_exit_min"] * 60:
@@ -418,6 +428,79 @@ def session_tick() -> dict:
     s["wake_due"] = now.timestamp() + wake if wake else None
     save_state(state)
     return out
+
+
+def _execute(c, state, s, snap, acct, now, nw, side, sl_raw, tp_raw, pattern, signal_id, risk_mult=1.0, extra=None):
+    """Size, send and verify one trade (gates already checked by the caller). Shared by the rule-signal path
+    (place_trade_checked) and the AI path (open_trade). Never raises the configured risk: risk_mult <= 1."""
+    extra = extra or {}
+    info, tick = snap["info"], snap["tick"]
+    buy = side == "buy"
+    entry = tick.ask if buy else tick.bid
+    sl, d = round(sl_raw, info.digits), info.digits
+    sl_dist = abs(entry - sl)
+    if (buy and sl >= entry) or (not buy and sl <= entry) or sl_dist <= 0:
+        return {"ok": False, "error": "sl_wrong_side_of_entry"}
+    if tp_raw is None:
+        tp = round(entry + c["tp_r"] * sl_dist if buy else entry - c["tp_r"] * sl_dist, d)
+    else:
+        tp = round(tp_raw, d)
+        if (buy and tp <= entry) or (not buy and tp >= entry):
+            return {"ok": False, "error": "tp_wrong_side_of_entry"}
+    if abs(tp - entry) / sl_dist < c["min_rr"]:
+        return {"ok": False, "error": "rr_below_min"}
+    risk_money = acct.equity * c["risk_pct"] / 100 * risk_mult
+    lots, why = risk.lots_for_risk(risk_money, sl_dist, info.trade_tick_size, info.trade_tick_value_loss,
+                                   info.volume_min, info.volume_step, info.volume_max, c["max_lot"],
+                                   c["min_lot_risk_mult"])
+    if lots is None:
+        return {"ok": False, "error": why}
+    otype = mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL
+    margin = mt5.order_calc_margin(otype, c["symbol"], lots, entry)
+    if margin is None or margin > acct.margin_free * c["margin_use_max"]:
+        return {"ok": False, "error": f"margin_{margin}_vs_free_{acct.margin_free}"}
+
+    plan = {"signal_id": signal_id, "side": side, "entry": entry, "sl": sl, "tp": tp, "lots": lots,
+            "risk_money": round(risk_money, 2), "risk_pct": round(c["risk_pct"] * risk_mult, 3), "bias": snap["bias"],
+            "atr": round(snap["atr"], 1), "spread": round(snap["spread"]), "pattern": pattern,
+            "news": nw["reason"] or "clear", "hour": now.astimezone(clock.SAST).hour, "regime": s.get("regime"), **extra}
+    if DRY:
+        jr.append(JOURNAL_F, {"type": "dry_trade", **plan})
+        return {"ok": True, "dry_run": True, **plan}
+
+    req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": c["symbol"], "volume": lots, "type": otype, "price": entry,
+           "sl": sl, "tp": tp, "deviation": 30, "magic": c["magic"], "comment": "claude auto",
+           "type_time": mt5.ORDER_TIME_GTC}
+    r = _send(req)
+    if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
+        jr.append(JOURNAL_F, {"type": "error", "stage": "send", **plan, "retcode": getattr(r, "retcode", None)})
+        return {"ok": False, "error": "send_failed", "detail": _result(r)}
+    pos = None
+    for _ in range(5):
+        tracked = set(state["positions"])
+        pos = next((p for p in _positions(c) if str(p.ticket) not in tracked), None)
+        if pos:
+            break
+        time.sleep(0.4)
+    tol = 3 * info.point
+    if pos is None or abs(pos.sl - sl) > tol or abs(pos.tp - tp) > tol or abs(pos.volume - lots) > 1e-9:
+        known = set(state["positions"])
+        for p in _positions(c):
+            if str(p.ticket) not in known:  # only the position this call opened, never an already-managed one
+                _close(p, "claude mismatch")
+        jr.append(JOURNAL_F, {"type": "error", "stage": "verify", **plan})
+        return {"ok": False, "error": "verification_mismatch_closed"}
+    r_dist = abs(pos.price_open - sl)
+    state["positions"][str(pos.ticket)] = {"side": side, "entry": pos.price_open, "r_dist": r_dist,
+                                           "risk_money": risk_money, "signal_id": signal_id, "lots": lots,
+                                           **{k: plan[k] for k in ("pattern", "bias", "atr", "spread", "hour", "regime")},
+                                           "thesis": extra.get("thesis")}
+    s["trades"] += 1
+    state["last_signal_id"] = signal_id
+    save_state(state)
+    jr.append(JOURNAL_F, {"type": "trade", **plan, "ticket": pos.ticket, "fill": pos.price_open,
+                          "slippage": round(abs(pos.price_open - entry) / info.point)})
+    return {"ok": True, "ticket": pos.ticket, **plan, "fill": pos.price_open}
 
 
 @mcp.tool()
@@ -453,65 +536,133 @@ def place_trade_checked(side: str, signal_id: str) -> dict:
     if hit:
         return {"ok": False, "error": "filtered", "filter": hit}
 
-    info, tick = snap["info"], snap["tick"]
-    buy = side == "buy"
-    entry = tick.ask if buy else tick.bid
-    sl, d = round(sig["sl"], info.digits), info.digits
-    sl_dist = abs(entry - sl)
-    if (buy and sl >= entry) or (not buy and sl <= entry) or sl_dist <= 0:
-        return {"ok": False, "error": "sl_wrong_side_of_entry"}
-    tp = round(entry + c["tp_r"] * sl_dist if buy else entry - c["tp_r"] * sl_dist, d)
-    if abs(tp - entry) / sl_dist < c["min_rr"]:
-        return {"ok": False, "error": "rr_below_min"}
-    risk_money = acct.equity * c["risk_pct"] / 100
-    lots, why = risk.lots_for_risk(risk_money, sl_dist, info.trade_tick_size, info.trade_tick_value_loss,
-                                   info.volume_min, info.volume_step, info.volume_max, c["max_lot"],
-                                   c["min_lot_risk_mult"])
-    if lots is None:
-        return {"ok": False, "error": why}
-    otype = mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL
-    margin = mt5.order_calc_margin(otype, c["symbol"], lots, entry)
-    if margin is None or margin > acct.margin_free * c["margin_use_max"]:
-        return {"ok": False, "error": f"margin_{margin}_vs_free_{acct.margin_free}"}
+    return _execute(c, state, s, snap, acct, now, nw, side, sig["sl"], None, sig["pattern"], signal_id)
 
-    plan = {"signal_id": signal_id, "side": side, "entry": entry, "sl": sl, "tp": tp, "lots": lots,
-            "risk_money": round(risk_money, 2), "risk_pct": c["risk_pct"], "bias": snap["bias"],
-            "atr": round(snap["atr"], 1), "spread": round(snap["spread"]), "pattern": sig["pattern"],
-            "news": nw["reason"] or "clear", "hour": now.astimezone(clock.SAST).hour, "regime": s.get("regime")}
-    if DRY:
-        jr.append(JOURNAL_F, {"type": "dry_trade", **plan})
-        return {"ok": True, "dry_run": True, **plan}
 
-    req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": c["symbol"], "volume": lots, "type": otype, "price": entry,
-           "sl": sl, "tp": tp, "deviation": 30, "magic": c["magic"], "comment": "claude auto",
-           "type_time": mt5.ORDER_TIME_GTC}
-    r = _send(req)
-    if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
-        jr.append(JOURNAL_F, {"type": "error", "stage": "send", **plan, "retcode": getattr(r, "retcode", None)})
-        return {"ok": False, "error": "send_failed", "detail": _result(r)}
-    pos = None
-    for _ in range(5):
-        tracked = set(state["positions"])
-        pos = next((p for p in _positions(c) if str(p.ticket) not in tracked), None)
-        if pos:
-            break
-        time.sleep(0.4)
-    tol = 3 * info.point
-    if pos is None or abs(pos.sl - sl) > tol or abs(pos.tp - tp) > tol or abs(pos.volume - lots) > 1e-9:
-        for p in _positions(c):
-            _close(p, "claude mismatch")
-        jr.append(JOURNAL_F, {"type": "error", "stage": "verify", **plan})
-        return {"ok": False, "error": "verification_mismatch_closed"}
-    r_dist = abs(pos.price_open - sl)
-    state["positions"][str(pos.ticket)] = {"side": side, "entry": pos.price_open, "r_dist": r_dist,
-                                           "risk_money": risk_money, "signal_id": signal_id, "lots": lots,
-                                           **{k: plan[k] for k in ("pattern", "bias", "atr", "spread", "hour", "regime")}}
-    s["trades"] += 1
-    state["last_signal_id"] = signal_id
+AI_SETUPS = ("pullback", "orb", "breakout", "reversal", "sweep", "trend", "other")
+
+
+def _rates(c, tf, n=320):
+    r = mt5.copy_rates_from_pos(c["symbol"], tf, 0, n)
+    return None if r is None or len(r) < 60 else r[:-1]  # closed bars only
+
+
+@mcp.tool()
+def market_brief() -> dict:
+    """AI analysis input: precomputed multi-timeframe brief (trend, EMA distances in ATR, RSI, momentum, previous-day
+    and today's levels, VWAP, US-open range, last 12 M5 candles) plus the rule signal and open positions. Compact:
+    never fetch raw candles for analysis."""
+    _ensure()
+    c = cfg()
+    mt5.symbol_select(c["symbol"], True)
+    tick, info = mt5.symbol_info_tick(c["symbol"]), mt5.symbol_info(c["symbol"])
+    bars = [_rates(c, tf) for tf in (mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4)]
+    if tick is None or info is None or any(b is None for b in bars):
+        return {"ok": False, "error": "no_data"}
+    out = brief.build(*bars, tick.bid, tick.ask, time.time(), info.digits)
+    snap = snapshot(c)
+    out["symbol"] = c["symbol"]
+    out["rule_signal"] = ({k: (round(v, 2) if isinstance(v, float) else v) for k, v in snap["signal"].items()}
+                          if snap.get("ok") and snap["signal"] else snap.get("why"))
+    state = load_state()
+    out["pos"] = _pos_view(state, c, snap) if snap.get("ok") else []
+    ev = news.next_event(str(CAL_F), time.time(), 120)
+    if ev:
+        out["event_in_s"], out["event"] = ev["in_s"], ev["title"]
+    return out
+
+
+@mcp.tool()
+def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mult: float = 1.0) -> dict:
+    """AI-originated entry. You choose side, stop and target from market_brief; code enforces everything else: the same
+    gates as rule trades (phase, news, spread, ATR band, position/trade/loss limits, daily stop, risk flag, KILL/HALT),
+    stop on the correct side and between min_sl_atr and max_sl_atr x ATR, reward:risk >= min_rr, lots sized from risk_pct
+    x risk_mult (0.25-1.0: scale DOWN for lower conviction, never up), margin check, fill verification. One AI entry per
+    side per bar. setup in pullback|orb|breakout|reversal|sweep|trend|other; thesis <=200 chars (why now, what
+    invalidates it) is stored on the trade for the learning review."""
+    _ensure()
+    c = cfg()
+    now = datetime.now(timezone.utc)
+    if side not in ("buy", "sell") or setup not in AI_SETUPS or not thesis.strip() or not (0.25 <= risk_mult <= 1.0):
+        return {"ok": False, "error": f"bad_args (side buy|sell, setup in {AI_SETUPS}, thesis required, risk_mult 0.25-1)"}
+    state = load_state()
+    acct = mt5.account_info()
+    roll_state(state, acct.equity, now)
+    s = state.get("run")
+    if not s or s.get("ended") or now.timestamp() - s["start_ts"] >= c["run_max_minutes"] * 60:
+        return {"ok": False, "error": "no_active_run"}
+    ph = clock.phase(now, c, now.timestamp() - s["start_ts"])
+    snap = snapshot(c)
+    if not snap["ok"]:
+        return {"ok": False, "error": "no_data"}
+    sid = f"ai-{c['symbol']}-{int(snap['closed'][-1]['time'])}-{side}"
+    if state.get("last_signal_id") == sid:
+        return {"ok": False, "error": "already_traded_this_bar"}
+    nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
+    ctx = _gate_ctx(c, ph, snap, s, state, _positions(c), nw, now, acct.equity,
+                    (STATE_DIR / "KILL").exists(), (STATE_DIR / "HALT").exists())
+    blk = gates.blockers(ctx)
+    if blk:
+        return {"ok": False, "error": "gated", "gates": blk}
+    hit = _filter_hit({"side": side, "pattern": "ai-" + setup}, snap, s, now)
+    if hit:
+        return {"ok": False, "error": "filtered", "filter": hit}
+    entry = snap["tick"].ask if side == "buy" else snap["tick"].bid
+    dist = abs(entry - sl)
+    if not (c["min_sl_atr"] * snap["atr"] <= dist <= c["max_sl_atr"] * snap["atr"]):
+        return {"ok": False, "error": f"sl_dist_{dist:.2f}_outside_{c['min_sl_atr']}-{c['max_sl_atr']}_atr({snap['atr']:.2f})"}
+    return _execute(c, state, s, snap, acct, now, nw, side, sl, tp, "ai-" + setup, sid, risk_mult,
+                    {"thesis": thesis.strip()[:200], "ai": True})
+
+
+@mcp.tool()
+def adjust_position(ticket: int, action: str, value: float = 0.0, why: str = "") -> dict:
+    """AI position management on a bot position. action: 'tighten_sl' (value = new stop; must be strictly closer to price
+    than the current stop, on the protective side of price and beyond the broker stop level: a stop is NEVER widened or
+    removed), 'partial' (value = fraction 0.1-0.9 to close), 'close' (exit now). Automatic BE/trail/partial/pre-event
+    logic keeps running underneath."""
+    _ensure()
+    c = cfg()
+    p = next((x for x in _positions(c) if x.ticket == ticket), None)
+    if p is None:
+        return {"ok": False, "error": "no_such_bot_position"}
+    state = load_state()
+    rec = state["positions"].get(str(ticket))
+    if rec is None:
+        return {"ok": False, "error": "untracked_position"}
+    info, tick = mt5.symbol_info(p.symbol), mt5.symbol_info_tick(p.symbol)
+    buy = p.type == mt5.POSITION_TYPE_BUY
+    if action == "tighten_sl":
+        price = tick.bid if buy else tick.ask
+        new = round(value, info.digits)
+        gap = max(info.trade_stops_level, 1) * info.point
+        if (buy and not (p.sl < new <= price - gap)) or (not buy and not (price + gap <= new < p.sl)):
+            return {"ok": False, "error": f"sl_must_tighten_and_respect_stop_level (cur {p.sl}, price {price})"}
+        res = _result(mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": ticket, "symbol": p.symbol,
+                                      "sl": new, "tp": p.tp}))
+        ok, detail = res["ok"], {"sl": new}
+    elif action == "partial":
+        if not (0.1 <= value <= 0.9):
+            return {"ok": False, "error": "fraction 0.1-0.9"}
+        vol = risk.partial_close_lots(p.volume, value, info.volume_min, info.volume_step)
+        if vol <= 0:
+            return {"ok": False, "error": "too_small_to_split"}
+        r = _send({"action": mt5.TRADE_ACTION_DEAL, "position": ticket, "symbol": p.symbol, "volume": vol,
+                   "type": mt5.ORDER_TYPE_SELL if buy else mt5.ORDER_TYPE_BUY,
+                   "price": tick.bid if buy else tick.ask, "deviation": 30, "magic": p.magic, "comment": "claude ai partial"})
+        ok, detail = bool(r and r.retcode == mt5.TRADE_RETCODE_DONE), {"lots": vol}
+        if ok:
+            rec["partial_done"] = True
+    elif action == "close":
+        rec["closed_by"] = "ai"
+        r = _close(p, "claude ai close")
+        ok, detail = bool(r and r.retcode == mt5.TRADE_RETCODE_DONE), {}
+    else:
+        return {"ok": False, "error": "action must be tighten_sl|partial|close"}
     save_state(state)
-    jr.append(JOURNAL_F, {"type": "trade", **plan, "ticket": pos.ticket, "fill": pos.price_open,
-                          "slippage": round(abs(pos.price_open - entry) / info.point)})
-    return {"ok": True, "ticket": pos.ticket, **plan, "fill": pos.price_open}
+    jr.append(JOURNAL_F, {"type": "ai_adjust", "ticket": ticket, "action": action, "value": value, "ok": ok,
+                          "why": why[:160]})
+    return {"ok": ok, "action": action, **detail}
 
 
 @mcp.tool()
