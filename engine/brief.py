@@ -5,7 +5,7 @@ last few M5 candles. Distances are in ATR units where that makes them comparable
 """
 import numpy as np
 
-from . import indicators as ind, signal as sg
+from . import indicators as ind, levels, signal as sg, smc, swing as sw
 
 
 def rsi(c, n=14):
@@ -17,10 +17,10 @@ def rsi(c, n=14):
     au, ad = up[:n].mean(), dn[:n].mean()
     for u, w in zip(up[n:], dn[n:]):
         au, ad = (au * (n - 1) + u) / n, (ad * (n - 1) + w) / n
-    return round(100.0 if ad == 0 else 100 - 100 / (1 + au / ad), 1)
+    return round(float(100.0 if ad == 0 else 100 - 100 / (1 + au / ad)), 1)
 
 
-def build(m5, m15, h1, h4, bid, ask, now_ts, digits=2):
+def build(m5, m15, h1, h4, bid, ask, now_ts, digits=2, m1=None):
     """m5/m15/h1/h4: closed-bar structured arrays (time/open/high/low/close/tick_volume). Returns a small dict."""
     r = lambda x: None if x is None else round(float(x), digits)
     c5, h5, l5 = (np.asarray(m5[k], float) for k in ("close", "high", "low"))
@@ -61,4 +61,20 @@ def build(m5, m15, h1, h4, bid, ask, now_ts, digits=2):
     out["last_m5"] = [[int(t) % 86400 // 3600 * 100 + int(t) % 3600 // 60, r(o), r(h), r(l), r(c)]
                       for t, o, h, l, c in zip(m5["time"][-12:], m5["open"][-12:], m5["high"][-12:],
                                                m5["low"][-12:], m5["close"][-12:])]  # [HHMM utc, o, h, l, c]
+    try:  # support/resistance and smart-money read for scalps (zones in M5-ATR units; the swing_brief carries the full read)
+        frames = [(n, b["high"], b["low"], ind.atr(b["high"], b["low"], b["close"], 14))
+                  for n, b in (("m5", m5), ("m15", m15), ("h1", h1), ("h4", h4))]
+        out["sr"] = {**sw.compact_zones(levels.build(frames, mid, a5, 12), digits), "round": levels.round_levels(mid, 1)}
+        out["smc_m5"], out["smc_m15"] = (smc.compact(smc.analyze(b), mid, digits) for b in (m5, m15))
+    except Exception as e:  # the extra read must never break the base brief
+        out["sr_error"] = str(e)[:60]
+    if m1 is not None and len(m1["close"]) > 30:  # scalp view: M1 volatility, cost in ATR, tape of the last 15 minutes
+        c1 = np.asarray(m1["close"], float)
+        a1 = ind.atr(m1["high"], m1["low"], c1, 14)
+        out["atr_m1"], out["spread_atr_m1"] = r(a1), round(float((ask - bid) / a1), 2)
+        out["rsi_m1"] = rsi(c1)
+        out["mom_m1_atr"] = {k: round(float((c1[-1] - c1[-1 - k]) / a1), 2) for k in (3, 10, 30)}
+        out["last_m1"] = [[int(t) % 86400 // 3600 * 100 + int(t) % 3600 // 60, r(o), r(h), r(l), r(c)]
+                          for t, o, h, l, c in zip(m1["time"][-15:], m1["open"][-15:], m1["high"][-15:],
+                                                   m1["low"][-15:], m1["close"][-15:])]
     return out

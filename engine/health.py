@@ -18,7 +18,7 @@ def check(recs, spread_max):
         if slip > SLIP_WARN:
             warns.append(f"slippage: median {slip:.0f}pt over last {len(last)} entries")
         spr = median(r.get("spread") or 0 for r in last)
-        if spr > SPREAD_FRAC_WARN * spread_max:
+        if spread_max and spr > SPREAD_FRAC_WARN * spread_max:
             warns.append(f"spread: median {spr:.0f}pt at entry vs max {spread_max}")
     if len(exits) >= 40:
         win = lambda xs: sum(1 for x in xs if x["outcome_r"] > 0.25) / len(xs)

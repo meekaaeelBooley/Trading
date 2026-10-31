@@ -17,14 +17,14 @@ def lots_for_risk(risk_money, sl_dist, tick_size, tick_value_loss, vol_min, vol_
     return round(lots, 2), "ok"
 
 
-def manage_sl(side, entry, price, sl, r_dist, atr, swing_extreme):
-    """New SL price or None. BE at +1R; after +1.5R trail behind swing (kept >= 1 ATR from price). Never loosens."""
+def manage_sl(side, entry, price, sl, r_dist, atr, swing_extreme, be_r=1.0, trail_r=1.5):
+    """New SL price or None. BE at +be_r R; after +trail_r R trail behind swing (kept >= 1 ATR from price). Never loosens."""
     sign = 1 if side == "buy" else -1
     profit = (price - entry) * sign
     best = sl
-    if profit >= 1.0 * r_dist and (best - entry) * sign < 0:
+    if profit >= be_r * r_dist and (best - entry) * sign < 0:
         best = entry
-    if profit >= 1.5 * r_dist:
+    if profit >= trail_r * r_dist:
         trail = swing_extreme - sign * 0.1 * atr
         if (price - trail) * sign >= atr and (trail - best) * sign > 0:
             best = trail
@@ -45,3 +45,13 @@ def partial_due(side, entry, price, r_dist, at_r):
     """True once price is at least at_r x R in profit."""
     sign = 1 if side == "buy" else -1
     return r_dist > 0 and (price - entry) * sign >= at_r * r_dist
+
+
+def widen_ok(side, entry, cur_sl, new_sl, r_dist, price, max_factor=1.5):
+    """A stop may be loosened only once, to at most max_factor x the original risk distance from entry, and stays on the
+    protective side of price. Returns True when new_sl is a legal (wider) stop."""
+    sign = 1 if side == "buy" else -1
+    wider = (cur_sl - new_sl) * sign > 0
+    within = (entry - new_sl) * sign <= max_factor * r_dist
+    protective = (price - new_sl) * sign > 0
+    return bool(wider and within and protective)

@@ -1,0 +1,63 @@
+{
+  "symbol": "USTECm",
+  "magic": 20261024,
+  "risk_pct": 5.0,
+  "max_positions": 99,
+  "max_trades_session": 150,
+  "max_consec_losses": 6,
+  "loss_threshold_r": 0.25,
+  "daily_stop_pct": 12.0,
+  "weekly_halt_pct": 25.0,
+  "tp_r": 1.5,
+  "min_rr": 1.2,
+  "sl_atr_mult": 1.0,
+  "max_sl_atr": 2.5,
+  "atr_min": 3,
+  "atr_max": 40,
+  "spread_max_points": 300,
+  "max_lot": 5.0,
+  "min_lot_risk_mult": 1.5,
+  "margin_use_max": 0.8,
+  "tick_stale_s": 180,
+  "break": [
+    "22:45",
+    "00:00"
+  ],
+  "flatten_before_break": false,
+  "news_before_min": 15,
+  "news_after_min": 10,
+  "calendar_max_age_h": 12,
+  "calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+  "live_enabled": false,
+  "run_max_minutes": 240,
+  "run_gap_new_s": 4000,
+  "no_entry_last_min": 10,
+  "no_entry_before_break_min": 25,
+  "no_entry_after_reopen_min": 5,
+  "tf_min": 5,
+  "strategies": [
+    "orb"
+  ],
+  "atr_bands": [
+    7,
+    14
+  ],
+  "spread_bands": [
+    150,
+    250
+  ],
+  "orb_bars": 3,
+  "orb_window_min": 90,
+  "min_sl_atr": 0.8,
+  "max_spread_r": 0.2,
+  "partial_at_r": 0.7,
+  "headline_check_min": 9999,
+  "desk_mode": true,
+  "desk_magics": [
+    20261024,
+    20261025
+  ],
+  "desk_max_positions": null,
+  "scout_impulse_atr": 1.4,
+  "scout_break_bars": 12
+}

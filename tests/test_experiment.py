@@ -79,3 +79,26 @@ def test_market_brief_is_compact_and_has_levels():
     assert "prev_day" in out and "today" in out and out["us_open_range"] != "forming"
     assert 0 <= out["rsi_m5"] <= 100
     assert len(str(out)) < 4000  # token budget
+
+
+def test_overrides_only_touch_soft_gates():
+    from engine import gates
+    ctx = dict(entry_ok=True, phase="ACTIVE", kill=False, halt=False, stopped=False, stop_reason="", demo_ok=True,
+               market_open=True, data_fresh=True, open_positions=2, max_positions=2, trades=5, max_trades=40,
+               consec_losses=4, max_consec=4, day_pct=0.0, daily_stop=12.0, news_blocked=True, news_reason="news:CPI",
+               spread=900, spread_max=400, atr=1.0, atr_min=8, atr_max=80, risk_flag="x")
+    assert len(gates.blockers(ctx)) == 6
+    ov = gates.apply_overrides(ctx, list(gates.OVERRIDABLE))
+    assert gates.blockers(ov) == []
+    ov2 = gates.apply_overrides({**ctx, "kill": True, "halt": True, "day_pct": -13.0, "demo_ok": False}, gates.OVERRIDABLE)
+    b = gates.blockers(ov2)
+    assert "KILL" in b and "HALT" in b and "daily_stop" in b and "not_demo" in b
+    assert gates.blockers(gates.apply_overrides({**ctx, "open_positions": 4}, ["position_open"])) != []  # capped at +2
+
+
+def test_widen_ok_is_bounded():
+    from engine import risk
+    assert risk.widen_ok("buy", 100, 98, 97, 2, 101)  # 1.5x of R=2 -> floor 97
+    assert not risk.widen_ok("buy", 100, 98, 96.9, 2, 101)  # beyond 1.5x
+    assert not risk.widen_ok("buy", 100, 98, 99, 2, 101)  # tightening is not widening
+    assert risk.widen_ok("sell", 100, 102, 103, 2, 99) and not risk.widen_ok("sell", 100, 102, 103.5, 2, 99)

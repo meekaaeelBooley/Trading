@@ -17,4 +17,7 @@ secrets*
 # runtime trading state (journal, positions, calendar cache, KILL/HALT) and bulk market data
 state/
 state-exp-*/
+state-scalp-*/
+state-xau/
+state-ustec/
 data/
