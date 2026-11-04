@@ -5,7 +5,7 @@ last few M5 candles. Distances are in ATR units where that makes them comparable
 """
 import numpy as np
 
-from . import indicators as ind, levels, signal as sg, smc, swing as sw
+from . import indicators as ind, signal as sg
 
 
 def rsi(c, n=14):
@@ -61,13 +61,6 @@ def build(m5, m15, h1, h4, bid, ask, now_ts, digits=2, m1=None):
     out["last_m5"] = [[int(t) % 86400 // 3600 * 100 + int(t) % 3600 // 60, r(o), r(h), r(l), r(c)]
                       for t, o, h, l, c in zip(m5["time"][-12:], m5["open"][-12:], m5["high"][-12:],
                                                m5["low"][-12:], m5["close"][-12:])]  # [HHMM utc, o, h, l, c]
-    try:  # support/resistance and smart-money read for scalps (zones in M5-ATR units; the swing_brief carries the full read)
-        frames = [(n, b["high"], b["low"], ind.atr(b["high"], b["low"], b["close"], 14))
-                  for n, b in (("m5", m5), ("m15", m15), ("h1", h1), ("h4", h4))]
-        out["sr"] = {**sw.compact_zones(levels.build(frames, mid, a5, 12), digits), "round": levels.round_levels(mid, 1)}
-        out["smc_m5"], out["smc_m15"] = (smc.compact(smc.analyze(b), mid, digits) for b in (m5, m15))
-    except Exception as e:  # the extra read must never break the base brief
-        out["sr_error"] = str(e)[:60]
     if m1 is not None and len(m1["close"]) > 30:  # scalp view: M1 volatility, cost in ATR, tape of the last 15 minutes
         c1 = np.asarray(m1["close"], float)
         a1 = ind.atr(m1["high"], m1["low"], c1, 14)

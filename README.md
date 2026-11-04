@@ -1,6 +1,6 @@
-# Multi-agent scalping + swing desk (Claude Code + MT5 demo)
+# Multi-agent scalping desk (Claude Code + MT5 demo)
 
-Claude Code agents scalp (M1) and swing trade (D1/H4/H1 support/resistance + smart money concepts) **XAUUSDm** and **USTECm** on an **Exness MT5 demo account**. A chief session orchestrates specialist
+Claude Code agents scalp **XAUUSDm** and **USTECm** (M5 bars) on an **Exness MT5 demo account**. A chief session orchestrates specialist
 subagents; Python enforces every limit. Demo only: this is an experiment, not financial advice, and no edge has been demonstrated.
 
 ```
@@ -8,7 +8,6 @@ you ──/desk──> chief (main session)
                  ├─ sentinel      macro/headline research, sets risk flags (veto only)
                  ├─ scalper-xau   5-min shifts on the `xau` MCP server    ┐ run in parallel, each isolated
                  ├─ scalper-ustec 5-min shifts on the `ustec` MCP server ┘ to its own instrument
-                 ├─ swing-xau / swing-ustec  one analysis pass about hourly (and on a swing_alert), holds hours to days
                  └─ coach         reviews, lessons, rule proposals
 Python (mt5_server.py + engine/): gates, sizing, stop band, reward:risk, cost guard, margin, fill check, partial/BE/trail,
 KILL/HALT, daily stop, run cap, journal. wait_for_trigger wakes an agent only when something happens.
@@ -26,13 +25,6 @@ KILL/HALT, daily stop, run cap, journal. wait_for_trigger wakes an agent only wh
   `/desk` start · `/desk-stop` flatten both instruments and stop all agents now · `/desk-status` · `/desk-resume` (clears KILL; `/desk` also does).
   They wrap `tools\desk.ps1`, which still works from a terminal.
 - Peak sessions in SAST (until 1 Nov): London/NY overlap 14:00-18:00, US cash open 15:30, USTECm break 22:45-00:00.
-
-## Swing book
-`swing_brief` gives the swing trader a Python-computed read per timeframe (D1/H4/H1/M15): market structure (BOS/CHoCH), order blocks,
-fair value gaps, liquidity pools and sweeps, premium/discount, merged support/resistance zones, previous day/week levels, round numbers,
-and ranked trade candidates. The scalpers get a compact version in `market_brief`. Swings risk 1.5% (min lot may stretch to 3.75%),
-need reward:risk >= 2, max 2 open / 3 per day, are managed in H1 units, closed before the weekend and after 96 h, and survive the scalp run
-cap on their broker-side SL/TP. Details: `CLAUDE.md` (Swing book) and `desk/swing.md`.
 
 ## Limits (code-enforced, `config.xau.json` / `config.ustec.json`; edit by hand)
 Risk 5% of equity per trade (`risk_mult` may only scale down) · no position-count cap (margin is the limit) · 150 trades per run ·

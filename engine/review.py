@@ -68,8 +68,6 @@ def analyze(exits, min_flag_n=8):
         "atr": _group(ex, lambda e: _band(e.get("atr"), ATR_BANDS)),
         "spread": _group(ex, lambda e: _band(e.get("spread"), SPREAD_BANDS)),
     }
-    if any(e.get("style") == "swing" for e in ex):
-        dims["style"] = _group(ex, lambda e: e.get("style", "scalp"))
     if any(e.get("regime") for e in ex):
         dims["regime"] = _group(ex, lambda e: e.get("regime") or "n/a")
     mix = {}

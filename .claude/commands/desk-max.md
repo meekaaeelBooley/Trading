@@ -24,10 +24,6 @@ shift end, sentinel/coach scheduling), with the differences below. Scope: `xau`,
    - `KILL`, `HALT`, `not_demo`, an error that repeats, or anything odd: that instrument stays stopped; tell the user.
    - If every instrument is permanently stopped: run the coach, print the final summary, and end the loop with `ScheduleWakeup(stop: true)`.
 7. Run the **coach** on `review_due` as in /desk, plus once every ~3 hours of wall time.
-   Swing passes follow /desk (NEXT PASS timer, `swing_alert:` lines). On a fresh run after a stop, launch the swing pass again with the new macro read.
-   Open swings keep their broker-side SL/TP through gaps and usage-limit pauses. Python closes them before the weekend (Fri 21:30 SAST) only while
-   a tick is running: on a Friday from 21:00 SAST keep a shift alive; if you cannot (usage limit), tell the user once that open swings will carry
-   over the weekend on their broker-side SL/TP.
 8. Print one status line per event as in /desk. Stop everything only on `/desk-stop`.
 
 Rules are unchanged from /desk: demo only, never touch config/state/HALT files, no raw order tools.

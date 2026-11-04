@@ -327,7 +327,7 @@ def test_reconcile_sums_partial_and_final_deals(srv):
                                  "atr": 50, "spread": 100, "hour": 10, "regime": "trend"}},
              "run": {"consec_losses": 1}}
     closed = s.reconcile(state, c)
-    assert closed == [{"ticket": 7, "r": 1.25, "why": "tp", "style": "scalp"}] and state["positions"] == {}
+    assert closed == [{"ticket": 7, "r": 1.25, "why": "tp"}] and state["positions"] == {}
     assert state["run"]["consec_losses"] == 0  # a real win resets the streak
     ex = [r for r in journal.read(str(s.JOURNAL_F)) if r["type"] == "exit"][0]
     assert ex["partial"] is True and ex["regime"] == "trend" and ex["mfe_r"] == 3.0

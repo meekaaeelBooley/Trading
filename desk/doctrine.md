@@ -36,18 +36,4 @@ Demo account, aggressive scalping on M5 bars. You are paid for decisions, not fo
   stop trading, say so in your report.
 
 ## Report (your final message of the shift, <=6 lines)
-`trades opened/closed, net R, day_pct, what worked / what did not, anything the chief must know, stop_loop yes/no`, plus a `swing_alert:` line if one arrived.
-
-## Support/resistance and smart money (in `market_brief`)
-`sr` = nearest zones as `[lo, hi, touches, timeframes, dist in M5 ATR]` (res above, sup below) plus the next round number;
-`smc_m5` / `smc_m15` = structure `trend`, last BOS/CHoCH, fresh/tested order blocks (`ob`), unfilled fair value gaps (`fvg`),
-resting liquidity above/below (`bsl`/`ssl`, `EQ` = equal highs/lows), last `sweep`, and `pd.loc` (0 = range low, 1 = high).
-- Best scalps stack two of: a zone with 3+ touches or an H1/H4 timeframe tag, a sweep of `bsl`/`ssl` that closed back, a fresh
-  order block / FVG on M5-M15 in the M15 trend direction, an M5 CHoCH. Stop beyond the zone / sweep extreme; target the next zone or pool.
-- Do not buy into a resistance zone or sell into support unless it is broken (close beyond + retest holds). Longs from `pd.loc` < 0.5,
-  shorts from > 0.5 unless the trend is strong. A tested order block is weaker than a fresh one.
-
-## Swing book (not yours)
-Positions with `style: swing` in `pos` belong to the swing traders: never adjust or close them (the tools refuse), ignore them for
-`pos_bar` and your own counters. If `wait_for_trigger` returns `swing_alert`, do nothing about it: copy it into your final report
-(`swing_alert: <side> <setup> <zone>`) so the chief can run the swing trader.
+`trades opened/closed, net R, day_pct, what worked / what did not, anything the chief must know, stop_loop yes/no`.

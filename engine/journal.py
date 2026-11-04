@@ -25,7 +25,7 @@ def stats(recs, risk_pct):
     losses = [r for r in rs if r <= 0]
     eq, peak, dd = 1.0, 1.0, 0.0
     for r, rec in zip(rs, ex):
-        eq *= 1 + r * (rec.get("risk_pct") or risk_pct) / 100  # swing exits carry their own risk %
+        eq *= 1 + r * (rec.get("risk_pct") or risk_pct) / 100  # each exit carries the risk % it was sized with
         peak = max(peak, eq)
         dd = max(dd, 1 - eq / peak)
     return {"n": len(rs), "win_rate": round(len(wins) / len(rs), 2), "expectancy_r": round(sum(rs) / len(rs), 3),

@@ -21,10 +21,7 @@ def main():
             continue
         allx += ex
         errs = sum(1 for r in recs if r.get("type") == "error")
-        sw = [r for r in ex if r.get("style") == "swing"]
-        print(f"{d:18s} {jr.stats([r for r in ex if r not in sw], 5.0)}  errors={errs}")
-        if sw:
-            print(f"{'':18s} swing: {jr.stats(sw, 1.5)}")
+        print(f"{d:18s} {jr.stats(ex, 5.0)}  errors={errs}")
         by = rv.analyze(ex).get("by", {}).get("pattern", {})
         if by:
             print(f"{'':18s} by pattern: {by}")

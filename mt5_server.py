@@ -16,7 +16,7 @@ from mcp.server.fastmcp import FastMCP
 
 from engine.defaults import DEFAULTS
 from engine import (brief, clock, exits as ex_, filters as flt, gates, health, indicators as ind, journal as jr,
-                    news, report, review as rv, risk, scout as sc, signal as sg, smc, swing as swg)
+                    news, report, review as rv, risk, scout as sc, signal as sg)
 from engine.run import roll_state, start_or_continue  # noqa: F401  (re-exported; logic lives in engine/run.py)
 
 ROOT = Path(__file__).parent
@@ -34,7 +34,6 @@ MAX_LOT = float(os.environ.get("MT5_MAX_LOT", "0.10"))  # cap for the manual pla
 DRY = os.environ.get("DRY_RUN") == "1"
 
 TF_MT5 = {1: mt5.TIMEFRAME_M1, 5: mt5.TIMEFRAME_M5, 15: mt5.TIMEFRAME_M15}
-STYLES = ("scalp", "swing")  # a tracked position is one or the other; untracked / old records count as scalp
 
 mcp = FastMCP("mt5")
 
@@ -110,23 +109,13 @@ def _close(p, comment="claude close"):
                   "price": tick.bid if buy else tick.ask, "deviation": 30, "magic": p.magic, "comment": comment})
 
 
-def _style(state, p):
-    return state["positions"].get(str(p.ticket), {}).get("style", "scalp")
-
-
-def _styled(c, state, style):
-    return [p for p in _positions(c) if _style(state, p) == style]
-
-
-def flatten(c, reason, state=None, only=None):
-    """Close bot positions (all, or only those of style `only`, which needs state) and cancel pending orders."""
+def flatten(c, reason):
+    """Close all bot positions and cancel pending orders."""
     acts = []
     for p in _positions(c):
-        if only and _style(state, p) != only:
-            continue
         r = _close(p, "claude flat")
         acts.append({"close": p.ticket, "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE), "why": reason})
-    for o in (mt5.orders_get(symbol=c["symbol"]) or []) if not only else []:
+    for o in mt5.orders_get(symbol=c["symbol"]) or []:
         if o.magic == c["magic"]:
             mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
             acts.append({"cancel": o.ticket})
@@ -174,21 +163,17 @@ def reconcile(state, c):
         why = _exit_reason(deals[-1], r, rec.get("closed_by"), c["loss_threshold_r"])
         t0 = next((d.time for d in all_deals if d.entry == mt5.DEAL_ENTRY_IN), None)
         mfe, mae = _excursions(c["symbol"], rec, t0, deals[-1].time)
-        style = rec.get("style", "scalp")
         # exit records are self-contained (entry features copied in) so analysis never needs a join
         jr.append(JOURNAL_F, {"type": "exit", "ticket": int(t), "signal_id": rec["signal_id"], "pnl": round(pnl, 2),
                               "outcome_r": r, "exit_reason": why, "exit_price": deals[-1].price,
                               "mfe_r": mfe, "mae_r": mae,
                               "dur_min": None if t0 is None else round((deals[-1].time - t0) / 60),
-                              "partial": bool(rec.get("partial_done")), "style": style, "risk_pct": rec.get("risk_pct"),
+                              "partial": bool(rec.get("partial_done")), "risk_pct": rec.get("risk_pct"),
                               **{k: rec.get(k) for k in ("side", "pattern", "bias", "atr", "spread", "hour", "regime", "thesis")}})
-        closed.append({"ticket": int(t), "r": r, "why": why, "style": style})
+        closed.append({"ticket": int(t), "r": r, "why": why})
         s = state["run"]
-        # only a real loss extends the streak; BE/scratch exits (> -loss_threshold_r) reset nothing; swing results
-        # never touch the scalp streak (a swing can close long after the run that opened it)
-        if style == "swing":
-            pass
-        elif r is not None and r <= -c["loss_threshold_r"]:
+        # only a real loss extends the streak; BE/scratch exits (> -loss_threshold_r) reset nothing
+        if r is not None and r <= -c["loss_threshold_r"]:
             s["consec_losses"] += 1
         elif r is None or r > 0:
             s["consec_losses"] = 0
@@ -205,8 +190,7 @@ def _excursions(symbol, rec, t0, t1):
     """(MFE_R, MAE_R) from M1 bars between entry and exit; (None, None) if unavailable."""
     try:
         now_b = mt5.symbol_info_tick(symbol).time
-        step, tf = (15, mt5.TIMEFRAME_M15) if rec.get("style") == "swing" else (1, mt5.TIMEFRAME_M1)  # long holds: coarser bars
-        bars = mt5.copy_rates_from_pos(symbol, tf, 0, min(5000, int((now_b - t0) / 60 / step) + 3))
+        bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, min(5000, int((now_b - t0) / 60) + 3))
         return ex_.excursions(bars, rec["side"], rec["entry"], rec["r_dist"], t0, t1)
     except Exception:
         return None, None
@@ -231,44 +215,12 @@ def _partial(p, rec, c, snap, frac=None):
     return {"partial": p.ticket, "lots": vol, "ok": ok}
 
 
-def _manage_swing(p, rec, c, snap, now_ts):
-    """Swing positions: closed before the weekend and after swing_max_hold_h, partial at swing_partial_at_r, then break-even
-    and an H1-structure trail. No pre-event exit (a swing is sized to sit through a release). A stop is never loosened."""
-    buy = p.type == mt5.POSITION_TYPE_BUY
-    price = snap["tick"].bid if buy else snap["tick"].ask
-    why = ("weekend" if swg.weekend_flat_due(datetime.fromtimestamp(now_ts, timezone.utc).astimezone(clock.SAST), c)
-           else "time_stop" if swg.held_too_long(rec.get("opened_ts"), now_ts, c["swing_max_hold_h"]) else None)
-    if why:
-        if now_ts - rec.get("flat_try_ts", 0) < 60:  # a closed market keeps refusing: retry once a minute, not every tick
-            return []
-        rec["closed_by"], rec["flat_try_ts"] = why, now_ts
-        r = _close(p, f"claude swing {why}")
-        return [{"swing": True, "swing_exit": p.ticket, "why": why, "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE)}]
-    acts = []
-    if c["partial_tp"] and not rec.get("partial_done") and risk.partial_due(
-            rec["side"], rec["entry"], price, rec["r_dist"], c["swing_partial_at_r"]):
-        acts.append({**_partial(p, rec, c, snap, c["swing_partial_frac"]), "swing": True})
-    h1 = _rates(c, mt5.TIMEFRAME_H1, 60)
-    if h1 is not None:
-        new = swg.manage_levels(rec["side"], rec["entry"], price, p.sl, rec["r_dist"],
-                                ind.atr(h1["high"], h1["low"], h1["close"], 14), h1, c)
-        if new is not None:
-            new = round(new, snap["info"].digits)
-            r = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": p.ticket, "symbol": p.symbol,
-                                "sl": new, "tp": p.tp})
-            acts.append({"swing": True, "sl": p.ticket, "to": new, "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE)})
-    return acts
-
-
 def manage(state, c, snap, now_ts=None):
     acts = []
     ev = news.next_event(str(CAL_F), now_ts or time.time(), 15) if c["pre_event_exit"] else None
     for p in _positions(c):
         rec = state["positions"].get(str(p.ticket))
         if not rec:
-            continue
-        if rec.get("style") == "swing":
-            acts += _manage_swing(p, rec, c, snap, now_ts or time.time())
             continue
         buy = p.type == mt5.POSITION_TYPE_BUY
         price = snap["tick"].bid if buy else snap["tick"].ask
@@ -329,7 +281,7 @@ def _pos_view(state, c, snap):
     for p in _positions(c):
         rec = state["positions"].get(str(p.ticket), {})
         r = round(p.profit / rec["risk_money"], 2) if rec.get("risk_money") else None
-        out.append({"ticket": p.ticket, "style": rec.get("style", "scalp"),
+        out.append({"ticket": p.ticket,
                     "side": rec.get("side") or ("buy" if p.type == 0 else "sell"),
                     "lots": p.volume, "open": p.price_open, "sl": p.sl, "tp": p.tp, "pnl_r": r})
     return out
@@ -372,8 +324,7 @@ def session_tick() -> dict:
     closed = reconcile(state, c)
     if closed:
         out["closed"] = closed
-        if any(x["style"] == "scalp" for x in closed):
-            out["do"] = "closed trade(s): annotate_trade ONLY if |R|>=1 or the exit looks wrong; one line, else skip"
+        out["do"] = "closed trade(s): annotate_trade ONLY if |R|>=1 or the exit looks wrong; one line, else skip"
 
     kill, halt = (STATE_DIR / "KILL").exists(), (STATE_DIR / "HALT").exists()
     day_pct = (equity - state["day"]["start_equity"]) / state["day"]["start_equity"] * 100
@@ -387,18 +338,14 @@ def session_tick() -> dict:
         s["stopped"], s["stop_reason"] = True, "consec_losses"
 
     opens = _positions(c)
-    # KILL / HALT / daily stop close everything. The run cap (FLATTEN) closes scalps only: swing positions are meant to
-    # outlive a 2 h run and rest on their broker-side SL/TP until the next tick manages them again.
-    hard_flat = kill or halt or s["stop_reason"] == "daily_stop"
-    if opens and (hard_flat or (phase == "FLATTEN" and _styled(c, state, "scalp"))):
-        actions += flatten(c, "kill" if kill else "halt" if halt else s["stop_reason"] or phase.lower(), state,
-                           None if hard_flat else "scalp")
+    must_flat = kill or halt or phase == "FLATTEN" or s["stop_reason"] == "daily_stop"
+    if must_flat and opens:
+        actions += flatten(c, "kill" if kill else "halt" if halt else s["stop_reason"] or phase.lower())
         opens = _positions(c)
-    scalp_opens = _styled(c, state, "scalp")
-    if s["trades"] >= c["max_trades_session"] and not scalp_opens and not s["stopped"]:
+    if s["trades"] >= c["max_trades_session"] and not opens and not s["stopped"]:
         s["stopped"], s["stop_reason"] = True, "max_trades"
 
-    stop_loop = ph["stop_loop"] or kill or halt or (s["stopped"] and not scalp_opens)
+    stop_loop = ph["stop_loop"] or kill or halt or (s["stopped"] and not opens)
     snap = None
     if phase in ("ACTIVE", "MANAGE") and (opens or not stop_loop):
         snap = snapshot(c)
@@ -410,12 +357,9 @@ def session_tick() -> dict:
 
     out.update({"eq": round(equity, 2), "day_pct": round(day_pct, 2), "trades": s["trades"],
                 "streak": s["consec_losses"]})
-    if c["swing_enabled"]:
-        out["swing_open"] = len(_styled(c, state, "swing"))
     if actions:
         out["actions"] = actions
     opens = _positions(c)
-    scalp_opens = _styled(c, state, "scalp")
     pos = _pos_view(state, c, snap) if opens else []
     if pos:
         out["pos"] = pos
@@ -429,7 +373,7 @@ def session_tick() -> dict:
         if not s["warm_done"]:
             todo = [] if c["desk_mode"] else ["run start: one WebSearch for USD/Nasdaq headline risk, then continue"]
             if LESSONS_F.exists():
-                out["lessons"] = _lessons("scalp")
+                out["lessons"] = _lessons()
             if len([r for r in jr.read(JOURNAL_F) if r.get("type") == "exit"]) - state.get("last_review_n", 0) >= REVIEW_EVERY:
                 if c["desk_mode"]:
                     out["review_due"] = True  # the coach agent owns reviews
@@ -457,7 +401,7 @@ def session_tick() -> dict:
     nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
     gate_list = []
     if snap and snap["ok"]:
-        ctx = _gate_ctx(c, ph, snap, s, state, scalp_opens, nw, now, equity, kill, halt)
+        ctx = _gate_ctx(c, ph, snap, s, state, opens, nw, now, equity, kill, halt)
         gate_list = gates.blockers(ctx)
         out.update({"bias": snap["bias"], "atr": round(snap["atr"], 1), "spread": round(snap["spread"])})
         if ph["entry_ok"] and not gate_list and snap["signal"]:
@@ -509,66 +453,11 @@ def session_tick() -> dict:
     return out
 
 
-_seen = {"bar": None, "event": None, "m15": None, "alerts": set(), "swing_alert": None}  # wait_for_trigger memory (one server process = one symbol)
+_seen = {"bar": None, "event": None}  # wait_for_trigger memory (one server process = one symbol)
 HARD_GATES = ("phase:", "KILL", "HALT", "stopped:", "not_demo", "market_closed", "stale_bars", "daily_stop", "desk_exposure")
 WAIT_KEYS = ("t", "phase", "eq", "day_pct", "trades", "streak", "pos", "gates", "event_in_s", "event", "signal", "closed",
              "actions", "stop_loop", "why_stop", "last20", "lessons", "review_due", "health", "do", "bias", "atr",
-             "spread", "report", "run_left_min", "filtered", "swing_open")
-
-
-def _swing_context(c, n_h1=320):
-    """Closed D1/H4/H1/M15 bars -> swing analysis context. Returns (ctx, price, tick, info) or None without data."""
-    _ensure()
-    sym = c["symbol"]
-    mt5.symbol_select(sym, True)
-    tick, info = mt5.symbol_info_tick(sym), mt5.symbol_info(sym)
-    d1, h4, h1, m15 = (_rates(c, tf, n) for tf, n in ((mt5.TIMEFRAME_D1, 250), (mt5.TIMEFRAME_H4, 320),
-                                                      (mt5.TIMEFRAME_H1, n_h1), (mt5.TIMEFRAME_M15, 320)))
-    if tick is None or info is None or h4 is None or h1 is None or m15 is None:
-        return None
-    price = (tick.bid + tick.ask) / 2
-    ctx = swg.analyze_all(d1, h4, h1, m15, price, time.time(), c)
-    return None if ctx is None else (ctx, price, tick, info)
-
-
-def _feasible(cands, price, info, equity, c):
-    """Annotate swing candidates with the % of equity risked at the smallest lot for their stop. A candidate whose stop
-    is too wide for the minimum lot (beyond swing_min_lot_risk_mult x swing_risk_pct) is flagged infeasible: open_swing
-    would refuse it, so the agent should skip it or find a tighter invalidation."""
-    per_unit = info.volume_min * info.trade_tick_value_loss / info.trade_tick_size  # money per 1.0 of price at min lot
-    for x in cands:
-        min_pct = per_unit * abs(price - x["sl"]) / equity * 100
-        x["risk_pct_est"] = round(max(c["swing_risk_pct"], min_pct), 2)
-        x["feasible"] = min_pct <= c["swing_risk_pct"] * c["swing_min_lot_risk_mult"]
-    return cands
-
-
-def _swing_alert_scan(c):
-    """On each new M15 bar, look for a swing idea that is `ready` (at its POI with confirmation) and strong enough;
-    remembered once in _seen so the scalper can pass it to the chief. Pure read: opens nothing."""
-    bar = mt5.copy_rates_from_pos(c["symbol"], mt5.TIMEFRAME_M15, 1, 1)
-    t = int(bar[0]["time"]) if bar is not None and len(bar) else None
-    if t is None or t == _seen["m15"]:
-        return
-    _seen["m15"] = t
-    state = load_state()
-    n_open = len(_styled(c, state, "swing"))
-    sw = state.get("swing") or {}
-    today = datetime.now(timezone.utc).astimezone(clock.SAST).date().isoformat()
-    if n_open >= c["swing_max_positions"] or (sw.get("date") == today and sw.get("n", 0) >= c["swing_max_per_day"]):
-        return
-    got = _swing_context(c)
-    if got is None:
-        return
-    ctx, price, _, info = got
-    if len(_seen["alerts"]) > 50:
-        _seen["alerts"].clear()
-    equity = mt5.account_info().equity
-    for cand in _feasible(swg.candidates(ctx, price, c, info.digits), price, info, equity, c):
-        if cand["feasible"] and cand["status"] == "ready" and cand["score"] >= c["swing_alert_min_score"] and cand["key"] not in _seen["alerts"]:
-            _seen["alerts"].add(cand["key"])
-            _seen["swing_alert"] = {k: cand[k] for k in ("side", "score", "setup", "zone", "sl", "tp", "rr")}
-            return
+             "spread", "report", "run_left_min", "filtered")
 
 
 @mcp.tool()
@@ -584,24 +473,21 @@ async def wait_for_trigger(max_s: int = 45) -> dict:
         out = session_tick()
         c = cfg()
         why = [k for k in ("stop_loop", "do", "signal", "review_due") if out.get(k)]
-        # swing activity (trails, partials, swing closures) is not the scalper's business: it never wakes the agent
-        if any(x.get("style", "scalp") == "scalp" for x in out.get("closed", [])):
+        if out.get("closed"):
             why.append("closed")
-        if any(not a.get("swing") for a in out.get("actions", [])):
+        if out.get("actions"):
             why.append("actions")
         if not out.get("stop_loop") and out.get("phase") in ("ACTIVE", "MANAGE"):
             bar = mt5.copy_rates_from_pos(c["symbol"], TF_MT5[int(c["tf_min"])], 1, 1)
             bar_t = int(bar[0]["time"]) if bar is not None and len(bar) else None
             if bar_t is not None and bar_t != _seen["bar"]:
                 first, _seen["bar"] = _seen["bar"] is None, bar_t
-                if any(x.get("style") == "scalp" for x in out.get("pos", [])):
+                if out.get("pos"):
                     why.append("pos_bar")
                 if not first and not any(str(g).startswith(HARD_GATES) for g in out.get("gates", [])):
                     snap = snapshot(c)
                     if snap["ok"]:
                         why += sc.scout(snap["closed"], snap["atr"], c["scout_impulse_atr"], int(c["scout_break_bars"]))
-            if c["swing_enabled"] and out.get("phase") == "ACTIVE":
-                _swing_alert_scan(c)
             ev_in = out.get("event_in_s")
             if ev_in is not None and ev_in <= 300 and _seen["event"] != out.get("event"):
                 _seen["event"] = out.get("event")
@@ -610,16 +496,14 @@ async def wait_for_trigger(max_s: int = 45) -> dict:
             res = {k: out[k] for k in WAIT_KEYS if k in out}
             res["trigger"] = why or ["quiet"]
             res["waited_s"] = round(time.time() - t0)
-            if _seen["swing_alert"]:  # one-shot note for the chief via the scalper's report; never a reason to act here
-                res["swing_alert"], _seen["swing_alert"] = _seen["swing_alert"], None
             return res
         await asyncio.sleep(3)
 
 
-def _lessons(style):
-    """Lessons for one book: swing lines carry the word SWING (coach convention), everything else is for scalps."""
+def _lessons():
+    """Lessons for the trader. Lines tagged `SWING:` are leftovers from the removed swing book and are not shown."""
     lines = LESSONS_F.read_text().strip().splitlines() if LESSONS_F.exists() else []
-    return "\n".join(x for x in lines if ("swing" in x.lower()) == (style == "swing"))
+    return "\n".join(x for x in lines if "swing:" not in x.lower())
 
 
 @mcp.tool()
@@ -632,7 +516,7 @@ def desk_brief() -> dict:
     exits = [r for r in jr.read(JOURNAL_F) if r.get("type") == "exit" and r.get("style", "scalp") == "scalp"]
     keys = ("side", "pattern", "outcome_r", "exit_reason", "dur_min", "mfe_r", "mae_r", "hour", "thesis")
     rf = s.get("risk_flag") or {}
-    return {"symbol": c["symbol"], "lessons": _lessons("scalp"),
+    return {"symbol": c["symbol"], "lessons": _lessons(),
             "last20": jr.stats(exits[-20:], c["risk_pct"]), "recent": [{k: r.get(k) for k in keys} for r in exits[-8:]],
             "run_trades": s.get("trades", 0), "streak": s.get("consec_losses", 0), "regime": s.get("regime"),
             "risk_flag": rf if rf.get("level") == "block" and (rf.get("until_ts") or 0) > time.time() else None,
@@ -644,8 +528,7 @@ def _execute(c, state, s, snap, acct, now, nw, side, sl_raw, tp_raw, pattern, si
     """Size, send and verify one trade (gates already checked by the caller). Shared by the rule-signal path
     (place_trade_checked) and the AI path (open_trade). Never raises the configured risk: risk_mult <= 1."""
     extra = extra or {}
-    swing = extra.get("style") == "swing"  # own risk %, own reward:risk floor, own counters; bar ATR in snap is H1 for swings
-    risk_pct, min_rr = (c["swing_risk_pct"], c["swing_min_rr"]) if swing else (c["risk_pct"], c["min_rr"])
+    risk_pct, min_rr = c["risk_pct"], c["min_rr"]
     info, tick = snap["info"], snap["tick"]
     buy = side == "buy"
     entry = tick.ask if buy else tick.bid
@@ -664,7 +547,7 @@ def _execute(c, state, s, snap, acct, now, nw, side, sl_raw, tp_raw, pattern, si
     risk_money = acct.equity * risk_pct / 100 * risk_mult
     lots, why = risk.lots_for_risk(risk_money, sl_dist, info.trade_tick_size, info.trade_tick_value_loss,
                                    info.volume_min, info.volume_step, info.volume_max, c["max_lot"],
-                                   c["swing_min_lot_risk_mult"] if swing else c["min_lot_risk_mult"])
+                                   c["min_lot_risk_mult"])
     if lots is None:
         return {"ok": False, "error": why}
     otype = mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL
@@ -706,15 +589,9 @@ def _execute(c, state, s, snap, acct, now, nw, side, sl_raw, tp_raw, pattern, si
     state["positions"][str(pos.ticket)] = {"side": side, "entry": pos.price_open, "r_dist": r_dist,
                                            "risk_money": risk_money, "signal_id": signal_id, "lots": lots,
                                            **{k: plan[k] for k in ("pattern", "bias", "atr", "spread", "hour", "regime")},
-                                           "thesis": extra.get("thesis"), "style": "swing" if swing else "scalp",
+                                           "thesis": extra.get("thesis"),
                                            "risk_pct": plan["risk_pct"], "opened_ts": time.time()}
-    if swing:
-        sw, today = state.setdefault("swing", {}), now.astimezone(clock.SAST).date().isoformat()
-        if sw.get("date") != today:
-            sw.update(date=today, n=0)
-        sw["n"] += 1
-    else:
-        s["trades"] += 1
+    s["trades"] += 1
     state["last_signal_id"] = signal_id
     save_state(state)
     jr.append(JOURNAL_F, {"type": "trade", **plan, "ticket": pos.ticket, "fill": pos.price_open,
@@ -745,7 +622,7 @@ def place_trade_checked(side: str, signal_id: str) -> dict:
     if state.get("last_signal_id") == signal_id:
         return {"ok": False, "error": "signal_already_traded"}
     nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
-    opens = _styled(c, state, "scalp")
+    opens = _positions(c)
     ctx = _gate_ctx(c, ph, snap, s, state, opens, nw, now, acct.equity,
                     (STATE_DIR / "KILL").exists(), (STATE_DIR / "HALT").exists())
     blk = gates.blockers(ctx)
@@ -826,7 +703,7 @@ def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mu
     if state.get("last_signal_id") == sid:
         return {"ok": False, "error": "already_traded_this_bar"}
     nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
-    ctx = _gate_ctx(c, ph, snap, s, state, _styled(c, state, "scalp"), nw, now, acct.equity,
+    ctx = _gate_ctx(c, ph, snap, s, state, _positions(c), nw, now, acct.equity,
                     (STATE_DIR / "KILL").exists(), (STATE_DIR / "HALT").exists())
     blk = gates.blockers(gates.apply_overrides(ctx, ovr))
     if blk:
@@ -849,24 +726,15 @@ def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mu
 
 @mcp.tool()
 def adjust_position(ticket: int, action: str, value: float = 0.0, why: str = "") -> dict:
-    """AI position management on a bot SCALP position (swing tickets are refused: use adjust_swing). action: 'tighten_sl' (value = new stop; must be strictly closer to price
+    """AI position management on a bot position. action: 'tighten_sl' (value = new stop; must be strictly closer to price
     than the current stop, on the protective side of price and beyond the broker stop level: a stop is NEVER widened or
     removed), 'widen_sl' (once per position, <=1.5x original risk, state your reason in why), 'set_tp' (move target),
     'partial' (value = fraction 0.1-0.9 to close), 'close' (exit now). Automatic BE/trail/partial/pre-event
     logic keeps running underneath."""
-    return _adjust(ticket, action, value, why, "scalp")
+    return _adjust(ticket, action, value, why)
 
 
-@mcp.tool()
-def adjust_swing(ticket: int, action: str, value: float = 0.0, why: str = "") -> dict:
-    """AI management of a bot SWING position (scalp tickets are refused). Same actions and rules as adjust_position:
-    'tighten_sl' (a stop is NEVER widened or removed), 'widen_sl' (once, <=1.5x original risk, give a reason), 'set_tp',
-    'partial' (value = fraction 0.1-0.9), 'close'. Python keeps running H1 break-even / trail / partial underneath and
-    closes swings before the weekend and after swing_max_hold_h."""
-    return _adjust(ticket, action, value, why, "swing")
-
-
-def _adjust(ticket, action, value, why, want):
+def _adjust(ticket, action, value, why):
     _ensure()
     c = cfg()
     p = next((x for x in _positions(c) if x.ticket == ticket), None)
@@ -876,9 +744,6 @@ def _adjust(ticket, action, value, why, want):
     rec = state["positions"].get(str(ticket))
     if rec is None:
         return {"ok": False, "error": "untracked_position"}
-    if rec.get("style", "scalp") != want:
-        return {"ok": False, "error": f"ticket is a {rec.get('style', 'scalp')} position: use "
-                                      f"{'adjust_swing' if rec.get('style') == 'swing' else 'adjust_position'}"}
     info, tick = mt5.symbol_info(p.symbol), mt5.symbol_info_tick(p.symbol)
     buy = p.type == mt5.POSITION_TYPE_BUY
     if action == "tighten_sl":
@@ -932,129 +797,11 @@ def _adjust(ticket, action, value, why, want):
     return {"ok": ok, "action": action, **detail}
 
 
-def _swing_gate(c, state, now, acct, side=None, ovr=()):
-    """Entry blockers for a swing: the shared hard gates (phase, KILL/HALT, daily stop, demo, market, stale data, news,
-    risk flag) minus the M1-scale scalp gates, plus the swing limits. Returns (blockers, phase, snap, run, news)."""
-    s = state.get("run")
-    if not s or s.get("ended") or now.timestamp() - s["start_ts"] >= c["run_max_minutes"] * 60:
-        return ["no_active_run"], None, None, s, None
-    ph = clock.phase(now, c, now.timestamp() - s["start_ts"])
-    snap = snapshot(c)
-    if not snap["ok"]:
-        return ["no_data"], ph, None, s, None
-    nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
-    ctx = _gate_ctx(c, ph, snap, s, state, [], nw, now, acct.equity, (STATE_DIR / "KILL").exists(),
-                    (STATE_DIR / "HALT").exists())
-    blk = gates.blockers(gates.apply_overrides(swg.swing_ctx(ctx), ovr))
-    sw_open = _styled(c, state, "swing")
-    sw = state.get("swing") or {}
-    today = now.astimezone(clock.SAST).date().isoformat()
-    side_open = next((state["positions"].get(str(p.ticket), {}).get("side") for p in sw_open), None)
-    blk += swg.swing_blockers(len(sw_open), sw.get("n", 0) if sw.get("date") == today else 0, side_open, side,
-                              now.astimezone(clock.SAST), c)
-    return blk, ph, snap, s, nw
-
-
 @mcp.tool()
-def swing_brief() -> dict:
-    """Swing analysis input (once per pass; never fetch raw candles): per-timeframe smart-money read (D1/H4/H1/M15: structure
-    trend, last BOS/CHoCH, order blocks fresh|tested, fair value gaps, buy/sell-side liquidity pools incl. equal
-    highs/lows, last sweep, premium/discount), merged support/resistance zones [lo, hi, touches, timeframes, dist in H1
-    ATR], previous day/week levels, round numbers, ranked trade `candidates` (status ready|at_poi|watch, score, sl, tp,
-    rr, reasons), your open swing positions, today's budget and the entry gates."""
-    c = cfg()
-    got = _swing_context(c)
-    if got is None:
-        return {"ok": False, "error": "no_data"}
-    ctx, price, tick, info = got
-    d, A = info.digits, ctx["A"]
-    r = lambda x: round(float(x), d)
-    state, now = load_state(), datetime.now(timezone.utc)
-    acct = mt5.account_info()
-    roll_state(state, acct.equity, now)
-    blk, ph, snap, _, _ = _swing_gate(c, state, now, acct)
-    mine = [x for x in _pos_view(state, c, snap) if x["style"] == "swing"] if snap else []
-    for x in mine:
-        rec = state["positions"].get(str(x["ticket"]), {})
-        x["age_h"] = round((time.time() - rec.get("opened_ts", time.time())) / 3600, 1)
-        x["thesis"] = rec.get("thesis")
-    sw = state.get("swing") or {}
-    today = now.astimezone(clock.SAST).date().isoformat()
-    exits = [x for x in jr.read(JOURNAL_F) if x.get("type") == "exit" and x.get("style") == "swing"]
-    out = {"ok": True, "symbol": c["symbol"], "t": now.astimezone(clock.SAST).strftime("%a %H:%M"), "price": r(price),
-           "spread": r(tick.ask - tick.bid), "atr_h1": r(ctx["atr"]), "phase": ph["phase"] if ph else None,
-           "gates": blk, "tf_trend": {k: v.get("trend") for k, v in A.items()},
-           "smc": {k: smc.compact(v, price, d) for k, v in A.items()},
-           "zones": swg.compact_zones(ctx["Z"], d),
-           "key": {k: {a: r(b) for a, b in v.items()} for k, v in ctx["key"].items()},
-           "round": ctx["round"], "pos": mine,
-           "candidates": _feasible(swg.candidates(ctx, price, c, d), price, info, acct.equity, c),
-           "budget": {"open": len(mine), "max": c["swing_max_positions"],
-                      "today": sw.get("n", 0) if sw.get("date") == today else 0, "max_per_day": c["swing_max_per_day"],
-                      "risk_pct": c["swing_risk_pct"], "min_rr": c["swing_min_rr"], "min_score": c["swing_min_score"],
-                      "stop_atr_h1": [c["swing_min_sl_atr"], c["swing_max_sl_atr"]]},
-           "stats": jr.stats(exits, c["swing_risk_pct"]),
-           "recent": [{k: x.get(k) for k in ("side", "pattern", "outcome_r", "exit_reason", "dur_min", "mfe_r", "mae_r",
-                                             "thesis")} for x in exits[-5:]],
-           "lessons": _lessons("swing")}
-    ev = news.next_event(str(CAL_F), time.time(), 240)
-    if ev:
-        out["event_in_s"], out["event"] = ev["in_s"], ev["title"]
-    return out
-
-
-@mcp.tool()
-def open_swing(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mult: float = 1.0,
-               override: str = "") -> dict:
-    """Open a SWING position (hold hours to days; multi-timeframe S/R + smart-money idea from swing_brief). Code enforces: demo,
-    KILL/HALT, daily stop, active run and ACTIVE phase, news and risk-flag gates, swing limits (max open, max per day, no
-    opposite swing, no stacking inside 1 ATR(H1) of an open same-side swing, no entries late Friday), stop on the correct
-    side and 0.7-3.0 x ATR(H1) away, reward:risk >= swing_min_rr (2.0), lots from swing_risk_pct (1%) x risk_mult
-    (0.25-1.0, never up), margin and fill verification. setup in ob_retest|fvg_fill|sr_bounce|sweep_reversal|break_retest|
-    choch_reversal|other; thesis <=200 chars (the zone, the confirmation, what invalidates it). override: news,risk_flag
-    only (logged)."""
+def flatten_all(reason: str = "manual") -> dict:
+    """Close all bot positions (magic) and cancel its pending orders."""
     _ensure()
-    c = cfg()
-    now = datetime.now(timezone.utc)
-    ovr = [x.strip() for x in override.split(",") if x.strip()]
-    if any(x not in swg.SWING_OVERRIDABLE for x in ovr):
-        return {"ok": False, "error": f"override must be from {swg.SWING_OVERRIDABLE}"}
-    if (side not in ("buy", "sell") or setup not in swg.SETUPS or not thesis.strip() or not (0.25 <= risk_mult <= 1.0)
-            or tp <= 0 or sl <= 0):
-        return {"ok": False, "error": f"bad_args (side buy|sell, setup in {swg.SETUPS}, tp and sl prices, thesis required, "
-                                      "risk_mult 0.25-1)"}
-    state = load_state()
-    acct = mt5.account_info()
-    roll_state(state, acct.equity, now)
-    blk, ph, snap, s, nw = _swing_gate(c, state, now, acct, side, ovr)
-    if blk:
-        return {"ok": False, "error": "gated", "gates": blk}
-    h1 = _rates(c, mt5.TIMEFRAME_H1, 120)
-    if h1 is None:
-        return {"ok": False, "error": "no_data"}
-    atr_h1 = ind.atr(h1["high"], h1["low"], h1["close"], 14)
-    tick = snap["tick"]
-    entry = tick.ask if side == "buy" else tick.bid
-    if not swg.stop_in_band(entry, sl, atr_h1, c):
-        return {"ok": False, "error": f"sl_dist_{abs(entry - sl):.2f}_outside_{c['swing_min_sl_atr']}-{c['swing_max_sl_atr']}"
-                                      f"_atr_h1({atr_h1:.2f})"}
-    for p in _styled(c, state, "swing"):
-        if abs(p.price_open - entry) < atr_h1:
-            return {"ok": False, "error": "stacking_within_1_atr_h1_of_open_swing"}
-    sid = f"sw-{c['symbol']}-{int(h1[-1]['time'])}-{side}"
-    if state.get("last_signal_id") == sid:
-        return {"ok": False, "error": "already_traded_this_h1_bar"}
-    if ovr:
-        jr.append(JOURNAL_F, {"type": "override", "signal_id": sid, "gates": ovr, "thesis": thesis.strip()[:200]})
-    return _execute(c, state, s, {**snap, "atr": atr_h1}, acct, now, nw, side, sl, tp, "swing-" + setup, sid, risk_mult,
-                    {"thesis": thesis.strip()[:200], "ai": True, "style": "swing"})
-
-
-@mcp.tool()
-def flatten_all(reason: str = "manual", include_swing: bool = True) -> dict:
-    """Close all bot positions (magic, scalp AND swing unless include_swing=false) and cancel its pending orders."""
-    _ensure()
-    return {"actions": flatten(cfg(), reason, load_state(), None if include_swing else "scalp")}
+    return {"actions": flatten(cfg(), reason)}
 
 
 @mcp.tool()
