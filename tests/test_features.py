@@ -407,3 +407,72 @@ def test_deep_review_reports_candidates_without_applying(srv, monkeypatch, tmp_p
     assert "hour=10&pattern=pin" in out["interactions_flagged"] and out["interactions_flagged"]["hour=10&pattern=pin"]["ci"]
     assert not (tmp_path / "filters.json").exists()  # never applied by the tool
     assert (tmp_path / "reports").is_dir()
+
+
+# ---- broker portability: server-time offset, symbol override, instrument class
+def test_brokertime_detects_whole_hour_offsets_and_ignores_stale_ticks():
+    from engine import brokertime as bk
+    now = 1_790_000_000.0
+    assert bk.candidate(now + 5, now) == 0  # UTC broker (Exness)
+    assert bk.candidate(now + 7200 + 3, now) == 7200  # GMT+2
+    assert bk.candidate(now + 10800 - 4, now) == 10800  # GMT+3 (DST)
+    assert bk.candidate(now - 900, now) is None  # 15 min old: not live
+    assert bk.candidate(now - 2 * 86400, now) is None  # weekend tick
+
+
+def test_brokertime_dst_change_needs_two_agreeing_ticks_and_override_wins():
+    from engine import brokertime as bk
+    now = 1_790_000_000.0
+    st = bk.new_state()
+    bk.update(st, now + 7200, now)
+    assert st["off"] == 7200
+    bk.update(st, now + 3600 + 10, now + 10)  # one tick that is exactly an hour "old": not enough to flip
+    assert st["off"] == 7200
+    bk.update(st, now + 10800 + 20, now + 20)  # a different live tick agreeing with the candidate? no: new candidate
+    assert st["off"] == 7200
+    bk.update(st, now + 10800 + 30, now + 30)  # second later tick agreeing -> accepted
+    assert st["off"] == 10800
+    assert bk.to_utc(now + 10800, st) == now
+    fixed = bk.new_state(2)
+    bk.update(fixed, now, now)
+    assert fixed["off"] == 7200
+
+
+class _OffsetMT5(FakeMT5):
+    """Broker on GMT+2: ticks and bars are labelled 2 h ahead of real UTC."""
+    def __init__(self, off=7200):
+        super().__init__()
+        self.off, self.now = off, 1_790_000_000.0
+
+    def symbol_info_tick(self, s):
+        return NS(time=int(self.now) + self.off, bid=100.0, ask=100.1)
+
+    def copy_rates_from_pos(self, *a):
+        return np.array([(int(self.now) + self.off - 300, 1.0)], dtype=[("time", "i8"), ("close", "f8")])
+
+
+def test_bars_and_ticks_are_converted_to_utc(srv, monkeypatch):
+    s, _ = srv
+    fake = _OffsetMT5()
+    monkeypatch.setattr(s, "mt5", fake)
+    monkeypatch.setattr(s.time, "time", lambda: fake.now)
+    monkeypatch.setattr(s, "_BT", {"state": None})
+    monkeypatch.delenv("BROKER_UTC_OFFSET_H", raising=False)
+    ts = s._tick_ts(fake.symbol_info_tick("X"))
+    assert ts == int(fake.now)  # +2h removed
+    bars = s._bars("X", 5, 1)
+    assert int(bars[0]["time"]) == int(fake.now) - 300
+    assert abs(fake.now - ts) <= 180  # what market_open compares: not 'stale'
+    assert (s.STATE_DIR / "broker_offset.json").exists()  # cached for a weekend restart
+
+
+def test_symbol_override_and_index_class(monkeypatch):
+    import mt5_server as s
+    from engine import playbook as pb
+    monkeypatch.setattr(s, "SYMBOL_OVERRIDE", "US100Cash")  # XM
+    assert s.cfg()["symbol"] == "US100Cash"
+    monkeypatch.setattr(s, "SYMBOL_OVERRIDE", "")
+    for name in ("USTEC", "USTECm", "US100", "US100Cash", "NAS100", "NAS100.cash", "NDX100"):
+        assert pb.instrument_class(name) == "index", name
+    for name in ("XAUUSDm", "GOLDmicro"):  # Exness, XM
+        assert pb.instrument_class(name) == "gold", name

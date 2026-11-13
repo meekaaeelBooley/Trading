@@ -13,4 +13,7 @@ DEFAULTS = {"partial_tp": True, "partial_at_r": 1.0, "partial_frac": 0.5,
             # tick no longer asks the trader agent to web-search or review; the scout decides which bars wake it
             "desk_mode": False, "scout_impulse_atr": 1.4, "scout_break_bars": 20,
             # account-wide cap across every bot magic in desk_magics (None = off); a hard gate, not overridable
-            "desk_magics": [], "desk_max_positions": None}
+            "desk_magics": [], "desk_max_positions": None,
+            # evidence-graded playbook (engine/playbook.py): trend_day (USTEC; impulse_cont and news_drift are shelved); the risk tier
+            # (moderate|high|extreme) comes from the root TIER flag file, not from config
+            "playbook": True}

@@ -49,22 +49,6 @@
       "PowerShell(.\\tools\\desk.ps1 *)",
       "TaskStop",
       "ListAgents"
-    ],
-    "deny": [
-      "mcp__xau__place_order",
-      "mcp__xau__modify_position",
-      "mcp__xau__cancel_order",
-      "mcp__xau__close_position",
-      "mcp__xau__place_trade_checked",
-      "mcp__ustec__place_order",
-      "mcp__ustec__modify_position",
-      "mcp__ustec__cancel_order",
-      "mcp__ustec__close_position",
-      "mcp__ustec__place_trade_checked",
-      "Edit(config*.json)",
-      "Write(config*.json)",
-      "Edit(state*/**)",
-      "Write(state*/**)"
     ]
   }
 }

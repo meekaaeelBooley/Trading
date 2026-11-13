@@ -1,4 +1,4 @@
-"""MCP server exposing a local MetaTrader 5 (Exness) terminal to Claude Code.
+"""MCP server exposing a local MetaTrader 5 terminal (Exness, XM or any MT5 broker) to Claude Code.
 
 Manual tools (account_info, get_price, ..., place_order) plus the autonomous-workflow tools
 (session_tick, place_trade_checked, flatten_all, journal_pass, session_summary, review, deep_review,
@@ -15,8 +15,8 @@ import MetaTrader5 as mt5
 from mcp.server.fastmcp import FastMCP
 
 from engine.defaults import DEFAULTS
-from engine import (brief, clock, exits as ex_, filters as flt, gates, health, indicators as ind, journal as jr,
-                    news, report, review as rv, risk, scout as sc, signal as sg)
+from engine import (brief, brokertime as bkt, clock, exits as ex_, filters as flt, gates, health, indicators as ind, journal as jr,
+                    news, playbook as pb, report, review as rv, risk, scout as sc, signal as sg)
 from engine.run import roll_state, start_or_continue  # noqa: F401  (re-exported; logic lives in engine/run.py)
 
 ROOT = Path(__file__).parent
@@ -29,7 +29,10 @@ LESSONS_F, PROPOSALS_F = STATE_DIR / "lessons.md", STATE_DIR / "proposals.md"
 FILTERS_F, REPORTS_DIR = STATE_DIR / "filters.json", ROOT / "reports"
 TAG = STATE_DIR.name  # report-file prefix distinguishing instances
 REVIEW_EVERY, MAX_LESSONS = 10, 25  # new closed trades between reviews; cap on lesson lines
-TERMINAL_PATH = os.environ.get("MT5_PATH", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
+# MT5_PATH pins one terminal; unset = attach to the installed/running terminal (falls back to the old Exness default path)
+TERMINAL_PATH = os.environ.get("MT5_PATH", "").strip()
+LEGACY_TERMINAL = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
+SYMBOL_OVERRIDE = os.environ.get("TRADING_SYMBOL", "").strip()  # per-machine broker symbol (Exness USTECm, XM US100Cash, ...)
 MAX_LOT = float(os.environ.get("MT5_MAX_LOT", "0.10"))  # cap for the manual place_order tool only
 DRY = os.environ.get("DRY_RUN") == "1"
 
@@ -40,14 +43,33 @@ mcp = FastMCP("mt5")
 
 # ---------------------------------------------------------------- helpers
 UNCAPPED_F = ROOT / "UNCAPPED"  # set by `tools\desk.ps1 uncap` (/desk-max): the run has no time cap
+TIER_F = ROOT / "TIER"  # set by `tools\desk.ps1 tier <moderate|high|extreme>` (or /desk ... <tier>): playbook risk tier
 
 
 def cfg():
     c = {**DEFAULTS, **json.loads(CONFIG_F.read_text())}
+    if SYMBOL_OVERRIDE:
+        c["symbol"] = SYMBOL_OVERRIDE
     c["spread_max_points"] = c["max_spread_r"] = None  # no spread limits (gate and cost guard), whatever the config file says
     if UNCAPPED_F.exists():
         c["run_max_minutes"] = 10 ** 7
+    c["tier"] = pb.read_tier(TIER_F)
     return c
+
+
+_pb_cache = {"mtime": None, "sus": []}
+
+
+def _pb_suspended():
+    """Strategies switched off by the pre-registered kill switch (live expectancy clearly below the backtest). Cached by
+    journal mtime so the 3 s tick never re-parses an unchanged journal."""
+    try:
+        mt = JOURNAL_F.stat().st_mtime
+    except OSError:
+        return []
+    if _pb_cache["mtime"] != mt:
+        _pb_cache.update(mtime=mt, sus=pb.suspended([r for r in jr.read(JOURNAL_F) if r.get("type") == "exit"]))
+    return _pb_cache["sus"]
 
 
 rv.configure_bands(cfg())
@@ -55,8 +77,59 @@ rv.configure_bands(cfg())
 
 def _ensure():
     if mt5.terminal_info() is None:
-        if not mt5.initialize(path=TERMINAL_PATH):
-            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        ok = mt5.initialize(path=TERMINAL_PATH) if TERMINAL_PATH else mt5.initialize()
+        if not ok and not TERMINAL_PATH and os.path.exists(LEGACY_TERMINAL):
+            ok = mt5.initialize(path=LEGACY_TERMINAL)
+        if not ok:
+            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()} (set MT5_PATH to your terminal64.exe, "
+                               "and make sure the terminal is logged in to a demo account)")
+
+
+# ---- broker server time -> UTC. MT5 timestamps are server time; Exness servers run UTC (offset 0), others GMT+2/+3.
+# Detected from live ticks (engine/brokertime.py), cached in the state dir, pinned by env BROKER_UTC_OFFSET_H (hours).
+_BT = {"state": None}
+
+
+def _bt_file():
+    return STATE_DIR / "broker_offset.json"
+
+
+def _bt_state():
+    if _BT["state"] is None:
+        env = os.environ.get("BROKER_UTC_OFFSET_H", "").strip()
+        st = bkt.new_state(float(env) if env else None)
+        if st["off"] is None:
+            try:
+                st["off"] = int(json.loads(_bt_file().read_text())["off"])
+            except Exception:
+                pass
+        _BT["state"] = st
+    return _BT["state"]
+
+
+def _tick_ts(tick):
+    """UTC epoch seconds of a tick (also feeds the offset detector)."""
+    st = _bt_state()
+    before = st["off"]
+    bkt.update(st, tick.time, time.time())
+    if st["off"] != before and not st["fixed"]:
+        try:
+            STATE_DIR.mkdir(exist_ok=True)
+            _bt_file().write_text(json.dumps({"off": st["off"]}))
+        except OSError:
+            pass
+    return bkt.to_utc(tick.time, st)
+
+
+def _bars(symbol, tf, n, pos=0):
+    """copy_rates_from_pos with bar times converted to UTC (a no-op when the broker runs UTC)."""
+    r = mt5.copy_rates_from_pos(symbol, tf, pos, n)
+    off = _bt_state()["off"] or 0
+    if r is None or not off:
+        return r
+    r = r.copy()
+    r["time"] = r["time"] - off
+    return r
 
 
 def _result(r):
@@ -129,7 +202,8 @@ def snapshot(c):
     tick, info = mt5.symbol_info_tick(sym), mt5.symbol_info(sym)
     if tick is None or info is None:
         return {"ok": False}
-    get = lambda tf: mt5.copy_rates_from_pos(sym, tf, 0, 320)
+    tick_ts = _tick_ts(tick)  # first: updates the broker-offset detector before any bars are converted
+    get = lambda tf: _bars(sym, tf, 320)
     tfm = int(c["tf_min"])
     m15, h1, h4 = get(TF_MT5[tfm]), get(mt5.TIMEFRAME_H1), get(mt5.TIMEFRAME_H4)
     if any(x is None or len(x) < 120 for x in (m15, h1, h4)):
@@ -140,10 +214,13 @@ def snapshot(c):
     sig, why = sg.find_any(closed, bias, c)
     if sig:
         sig["id"] = f"{sym}-{int(closed[-1]['time'])}-{sig['side']}"
+    playbook = []
+    if c["playbook"] and tfm == 5:  # the playbook is defined on closed M5 bars
+        playbook = pb.detect(sym, closed, c["tier"], suspended=_pb_suspended())
     return {"ok": True, "tick": tick, "info": info, "closed": closed, "bias": bias, "atr": atr, "signal": sig,
-            "why": why, "spread": (tick.ask - tick.bid) / info.point,
-            "market_open": abs(time.time() - tick.time) <= c["tick_stale_s"],
-            "data_fresh": int(m15[-1]["time"]) == int(tick.time) // (tfm * 60) * (tfm * 60)}
+            "playbook": playbook, "why": why, "spread": (tick.ask - tick.bid) / info.point,
+            "market_open": abs(time.time() - tick_ts) <= c["tick_stale_s"], "tick_ts": tick_ts,
+            "data_fresh": int(m15[-1]["time"]) == int(tick_ts) // (tfm * 60) * (tfm * 60)}
 
 
 def reconcile(state, c):
@@ -161,15 +238,18 @@ def reconcile(state, c):
         r = pnl / rec["risk_money"] if rec["risk_money"] else None
         r = None if r is None else round(r, 2)
         why = _exit_reason(deals[-1], r, rec.get("closed_by"), c["loss_threshold_r"])
-        t0 = next((d.time for d in all_deals if d.entry == mt5.DEAL_ENTRY_IN), None)
-        mfe, mae = _excursions(c["symbol"], rec, t0, deals[-1].time)
+        off = _bt_state()["off"] or 0  # deal times are broker time too
+        t0 = next((d.time - off for d in all_deals if d.entry == mt5.DEAL_ENTRY_IN), None)
+        t1 = deals[-1].time - off
+        mfe, mae = _excursions(c["symbol"], rec, t0, t1)
         # exit records are self-contained (entry features copied in) so analysis never needs a join
         jr.append(JOURNAL_F, {"type": "exit", "ticket": int(t), "signal_id": rec["signal_id"], "pnl": round(pnl, 2),
                               "outcome_r": r, "exit_reason": why, "exit_price": deals[-1].price,
                               "mfe_r": mfe, "mae_r": mae,
-                              "dur_min": None if t0 is None else round((deals[-1].time - t0) / 60),
+                              "dur_min": None if t0 is None else round((t1 - t0) / 60),
                               "partial": bool(rec.get("partial_done")), "risk_pct": rec.get("risk_pct"),
-                              **{k: rec.get(k) for k in ("side", "pattern", "bias", "atr", "spread", "hour", "regime", "thesis")}})
+                              **{k: rec.get(k) for k in ("side", "pattern", "bias", "atr", "spread", "hour", "regime", "thesis", "strategy",
+                                                   "tier")}})
         closed.append({"ticket": int(t), "r": r, "why": why})
         s = state["run"]
         # only a real loss extends the streak; BE/scratch exits (> -loss_threshold_r) reset nothing
@@ -189,8 +269,8 @@ def _exit_reason(deal, r, closed_by=None, loss_r=0.25):
 def _excursions(symbol, rec, t0, t1):
     """(MFE_R, MAE_R) from M1 bars between entry and exit; (None, None) if unavailable."""
     try:
-        now_b = mt5.symbol_info_tick(symbol).time
-        bars = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, min(5000, int((now_b - t0) / 60) + 3))
+        now_b = _tick_ts(mt5.symbol_info_tick(symbol))
+        bars = _bars(symbol, mt5.TIMEFRAME_M1, min(5000, int((now_b - t0) / 60) + 3))
         return ex_.excursions(bars, rec["side"], rec["entry"], rec["r_dist"], t0, t1)
     except Exception:
         return None, None
@@ -224,23 +304,59 @@ def manage(state, c, snap, now_ts=None):
             continue
         buy = p.type == mt5.POSITION_TYPE_BUY
         price = snap["tick"].bid if buy else snap["tick"].ask
+        runner = rec.get("mgmt") == "runner"  # playbook trade: no scalp partial / pre-event exit; time stop is in _time_stops
         # winners are banked before a high-impact release; a loser keeps its SL (never widened/removed)
-        if ev and 0 <= ev["in_s"] <= c["pre_event_exit_min"] * 60 and p.profit > 0:
+        if not runner and ev and 0 <= ev["in_s"] <= c["pre_event_exit_min"] * 60 and p.profit > 0:
             rec["closed_by"] = "pre_event"
             r = _close(p, "claude pre-event")
             acts.append({"pre_event_exit": p.ticket, "event": ev["title"],
                          "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE)})
             continue
-        if c["partial_tp"] and not rec.get("partial_done") and                 risk.partial_due(rec["side"], rec["entry"], price, rec["r_dist"], c["partial_at_r"]):
+        if (c["partial_tp"] and not runner and not rec.get("partial_done")
+                and risk.partial_due(rec["side"], rec["entry"], price, rec["r_dist"], c["partial_at_r"])):
             acts.append(_partial(p, rec, c, snap))
         last5 = snap["closed"][-5:]
         swing = float(last5["low"].min()) if buy else float(last5["high"].max())
-        new = risk.manage_sl(rec["side"], rec["entry"], price, p.sl, rec["r_dist"], snap["atr"], swing)
+        new = (risk.manage_sl(rec["side"], rec["entry"], price, p.sl, rec["r_dist"], snap["atr"], swing,
+                              be_r=pb.RUNNER["be_r"], trail_r=1e9) if runner else
+               risk.manage_sl(rec["side"], rec["entry"], price, p.sl, rec["r_dist"], snap["atr"], swing))
         if new is not None:
             new = round(new, snap["info"].digits)
             r = mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": p.ticket, "symbol": p.symbol,
                                 "sl": new, "tp": p.tp})
             acts.append({"sl": p.ticket, "to": new, "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE)})
+    return acts
+
+
+def _run_left_s(state, c, now_ts):
+    """Seconds left in the current run (None when no run is active)."""
+    r = state.get("run")
+    if not r or r.get("ended"):
+        return None
+    return r["start_ts"] + c["run_max_minutes"] * 60 - now_ts
+
+
+def _pb_view(sig, snap, run_left_s=None):
+    """Compact playbook signal for the agent: what, why, size cap, cost in R, hold length, and whether the run lasts that long.
+    A run-cap flatten before the time stop would turn the trade into an untested truncated variant, so open_trade refuses it."""
+    hold_s = sig["time_stop_ts"] - time.time()
+    d = {k: sig[k] for k in ("strategy", "side", "grade", "id", "why", "risk_mult", "age_bars")}
+    d.update(sl_dist=round(sig["sl_dist"], 2), atr=round(sig["atr"], 2),
+             cost_r=round(pb.cost_r(snap["tick"].ask - snap["tick"].bid, sig["sl_dist"]), 3),
+             hold_min=max(0, round(hold_s / 60)), fits_run=run_left_s is None or hold_s <= run_left_s)
+    return d
+
+
+def _time_stops(state, c, now_ts):
+    """Close playbook (runner) positions whose time stop has passed. Needs no snapshot, so it also runs in BREAK phase."""
+    acts = []
+    for p in _positions(c):
+        rec = state["positions"].get(str(p.ticket))
+        if rec and pb.time_stop_due(rec, now_ts):
+            rec["closed_by"] = "time_stop"
+            r = _close(p, "claude time stop")
+            acts.append({"time_stop": p.ticket, "strategy": rec.get("strategy"),
+                         "ok": bool(r and r.retcode == mt5.TRADE_RETCODE_DONE)})
     return acts
 
 
@@ -281,9 +397,19 @@ def _pos_view(state, c, snap):
     for p in _positions(c):
         rec = state["positions"].get(str(p.ticket), {})
         r = round(p.profit / rec["risk_money"], 2) if rec.get("risk_money") else None
-        out.append({"ticket": p.ticket,
-                    "side": rec.get("side") or ("buy" if p.type == 0 else "sell"),
-                    "lots": p.volume, "open": p.price_open, "sl": p.sl, "tp": p.tp, "pnl_r": r})
+        v = {"ticket": p.ticket, "side": rec.get("side") or ("buy" if p.type == 0 else "sell"),
+             "lots": p.volume, "open": p.price_open, "sl": p.sl, "tp": p.tp, "pnl_r": r}
+        if rec.get("mgmt") == "runner":
+            v["strategy"] = rec.get("strategy")
+            if rec.get("time_stop_ts"):
+                v["time_left_min"] = max(0, round((rec["time_stop_ts"] - time.time()) / 60))
+            tick = snap.get("tick") if snap else None
+            if tick is not None and rec.get("strategy") != "pyramid":
+                px = tick.bid if v["side"] == "buy" else tick.ask
+                add = pb.add_ok(c["tier"], v["side"], rec["entry"], p.sl, px, rec["r_dist"], rec.get("adds", 0))
+                if add:
+                    v["add_ok"] = add  # open_trade(setup="pyramid") is allowed: stop = this position's stop (break-even)
+        out.append(v)
     return out
 
 
@@ -292,7 +418,7 @@ def _pos_view(state, c, snap):
 def refresh_calendar() -> dict:
     """Fetch the USD high-impact economic calendar (ForexFactory JSON) into the local cache."""
     STATE_DIR.mkdir(exist_ok=True)
-    return news.refresh(str(CAL_F), cfg()["calendar_url"])
+    return news.refresh(str(CAL_F), cfg()["calendar_url"], fallback_csv=news.default_csv_paths(ROOT))
 
 
 @mcp.tool()
@@ -341,6 +467,9 @@ def session_tick() -> dict:
     must_flat = kill or halt or phase == "FLATTEN" or s["stop_reason"] == "daily_stop"
     if must_flat and opens:
         actions += flatten(c, "kill" if kill else "halt" if halt else s["stop_reason"] or phase.lower())
+        opens = _positions(c)
+    if opens and not must_flat:
+        actions += _time_stops(state, c, now.timestamp())
         opens = _positions(c)
     if s["trades"] >= c["max_trades_session"] and not opens and not s["stopped"]:
         s["stopped"], s["stop_reason"] = True, "max_trades"
@@ -414,6 +543,11 @@ def session_tick() -> dict:
                 out["signal"] = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in sig.items()}
         elif ph["entry_ok"] and not gate_list:
             out["no_signal"] = snap["why"]
+        if ph["entry_ok"] and snap.get("playbook"):
+            fresh = [x for x in snap["playbook"] if x["id"] not in state.get("pb_done", [])
+                     and not [g for g in gate_list if not (x["strategy"] == "news_drift" and str(g).startswith("news:"))]]
+            if fresh:
+                out["playbook"] = [_pb_view(x, snap, ph["run_left_s"]) for x in fresh]
         if (not c["desk_mode"] and ph["entry_ok"] and not opens and not stop_loop and not ctx["risk_flag"]
                 and now.timestamp() - s.get("last_headline_ts", s["start_ts"]) >= c["headline_check_min"] * 60):
             out["do"] = "; ".join(([out["do"]] if "do" in out else []) +
@@ -455,7 +589,7 @@ def session_tick() -> dict:
 
 _seen = {"bar": None, "event": None}  # wait_for_trigger memory (one server process = one symbol)
 HARD_GATES = ("phase:", "KILL", "HALT", "stopped:", "not_demo", "market_closed", "stale_bars", "daily_stop", "desk_exposure")
-WAIT_KEYS = ("t", "phase", "eq", "day_pct", "trades", "streak", "pos", "gates", "event_in_s", "event", "signal", "closed",
+WAIT_KEYS = ("t", "phase", "eq", "day_pct", "trades", "streak", "pos", "gates", "event_in_s", "event", "signal", "playbook", "closed",
              "actions", "stop_loop", "why_stop", "last20", "lessons", "review_due", "health", "do", "bias", "atr",
              "spread", "report", "run_left_min", "filtered")
 
@@ -472,13 +606,13 @@ async def wait_for_trigger(max_s: int = 45) -> dict:
     while True:
         out = session_tick()
         c = cfg()
-        why = [k for k in ("stop_loop", "do", "signal", "review_due") if out.get(k)]
+        why = [k for k in ("stop_loop", "do", "signal", "playbook", "review_due") if out.get(k)]
         if out.get("closed"):
             why.append("closed")
         if out.get("actions"):
             why.append("actions")
         if not out.get("stop_loop") and out.get("phase") in ("ACTIVE", "MANAGE"):
-            bar = mt5.copy_rates_from_pos(c["symbol"], TF_MT5[int(c["tf_min"])], 1, 1)
+            bar = _bars(c["symbol"], TF_MT5[int(c["tf_min"])], 1, pos=1)
             bar_t = int(bar[0]["time"]) if bar is not None and len(bar) else None
             if bar_t is not None and bar_t != _seen["bar"]:
                 first, _seen["bar"] = _seen["bar"] is None, bar_t
@@ -516,7 +650,11 @@ def desk_brief() -> dict:
     exits = [r for r in jr.read(JOURNAL_F) if r.get("type") == "exit" and r.get("style", "scalp") == "scalp"]
     keys = ("side", "pattern", "outcome_r", "exit_reason", "dur_min", "mfe_r", "mae_r", "hour", "thesis")
     rf = s.get("risk_flag") or {}
-    return {"symbol": c["symbol"], "lessons": _lessons(),
+    cls = pb.instrument_class(c["symbol"])
+    book = {n: {"grade": sp["grade"], "hold": sp["hold"], "risk_mult": pb.TIERS[c["tier"]]["risk"][n]}
+            for n, sp in pb.STRATEGIES.items() if sp["cls"] == cls and n in pb.TIERS[c["tier"]]["risk"]}
+    return {"symbol": c["symbol"], "tier": c["tier"], "playbook": book, "playbook_suspended": _pb_suspended(),
+            "lessons": _lessons(),
             "last20": jr.stats(exits[-20:], c["risk_pct"]), "recent": [{k: r.get(k) for k in keys} for r in exits[-8:]],
             "run_trades": s.get("trades", 0), "streak": s.get("consec_losses", 0), "regime": s.get("regime"),
             "risk_flag": rf if rf.get("level") == "block" and (rf.get("until_ts") or 0) > time.time() else None,
@@ -590,6 +728,8 @@ def _execute(c, state, s, snap, acct, now, nw, side, sl_raw, tp_raw, pattern, si
                                            "risk_money": risk_money, "signal_id": signal_id, "lots": lots,
                                            **{k: plan[k] for k in ("pattern", "bias", "atr", "spread", "hour", "regime")},
                                            "thesis": extra.get("thesis"),
+                                           **{k: extra[k] for k in ("strategy", "time_stop_ts", "mgmt", "tier", "cost_r")
+                                              if k in extra},
                                            "risk_pct": plan["risk_pct"], "opened_ts": time.time()}
     s["trades"] += 1
     state["last_signal_id"] = signal_id
@@ -635,11 +775,11 @@ def place_trade_checked(side: str, signal_id: str) -> dict:
     return _execute(c, state, s, snap, acct, now, nw, side, sig["sl"], None, sig["pattern"], signal_id)
 
 
-AI_SETUPS = ("pullback", "orb", "breakout", "reversal", "sweep", "trend", "other")
+AI_SETUPS = ("pullback", "orb", "breakout", "reversal", "sweep", "trend", "other") + pb.PLAYBOOK_SETUPS
 
 
 def _rates(c, tf, n=320):
-    r = mt5.copy_rates_from_pos(c["symbol"], tf, 0, n)
+    r = _bars(c["symbol"], tf, n)
     return None if r is None or len(r) < 60 else r[:-1]  # closed bars only
 
 
@@ -663,6 +803,10 @@ def market_brief() -> dict:
                           if snap.get("ok") and snap["signal"] else snap.get("why"))
     state = load_state()
     out["pos"] = _pos_view(state, c, snap) if snap.get("ok") else []
+    out["tier"] = c["tier"]
+    if snap.get("ok") and snap.get("playbook"):
+        left = _run_left_s(state, c, time.time())
+        out["playbook"] = [_pb_view(x, snap, left) for x in snap["playbook"] if x["id"] not in state.get("pb_done", [])]
     ev = news.next_event(str(CAL_F), time.time(), 120)
     if ev:
         out["event_in_s"], out["event"] = ev["in_s"], ev["title"]
@@ -676,7 +820,10 @@ def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mu
     gates as rule trades (phase, news, spread, ATR band, position/trade/loss limits, daily stop, risk flag, KILL/HALT),
     stop on the correct side and between min_sl_atr and max_sl_atr x ATR, reward:risk >= min_rr, lots sized from risk_pct
     x risk_mult (0.25-1.0: scale DOWN for lower conviction, never up), margin check, fill verification. One AI entry per
-    side per bar. setup in pullback|orb|breakout|reversal|sweep|trend|other; thesis <=200 chars (why now, what
+    side per bar. setup in pullback|orb|breakout|reversal|sweep|trend|other, or a PLAYBOOK setup (trend_day | impulse_cont |
+    news_drift | pyramid): those need an active `playbook` signal of that name and side (see wait_for_trigger / market_brief);
+    your sl/tp are IGNORED, the signal's stop, far target, size cap (risk_mult is capped, not raised), hold time and runner
+    management (no partial, break-even at +1.5R, time stop) are used. thesis <=200 chars (why now, what
     invalidates it) is stored on the trade for the learning review.
     override: comma list of SOFT gates you choose to bypass for this trade (atr, spread, news, risk_flag, consec_losses,
     position_open [max +2], max_trades [max 2x]); logged with your thesis. Never bypassable: demo check, KILL/HALT, daily
@@ -705,11 +852,15 @@ def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mu
     nw = news.gate(str(CAL_F), time.time(), c["news_before_min"], c["news_after_min"], c["calendar_max_age_h"])
     ctx = _gate_ctx(c, ph, snap, s, state, _positions(c), nw, now, acct.equity,
                     (STATE_DIR / "KILL").exists(), (STATE_DIR / "HALT").exists())
+    if setup == "news_drift" and "news" not in ovr:
+        ovr = ovr + ["news"]  # the strategy trades the release itself; every other gate still applies
     blk = gates.blockers(gates.apply_overrides(ctx, ovr))
     if blk:
         return {"ok": False, "error": "gated", "gates": blk}
     if ovr:
         jr.append(JOURNAL_F, {"type": "override", "signal_id": sid, "gates": ovr, "thesis": thesis.strip()[:200]})
+    if setup in pb.PLAYBOOK_SETUPS:
+        return _open_playbook(c, state, s, snap, acct, now, nw, side, setup, thesis, risk_mult)
     hit = _filter_hit({"side": side, "pattern": "ai-" + setup}, snap, s, now)
     if hit:
         return {"ok": False, "error": "filtered", "filter": hit}
@@ -722,6 +873,56 @@ def open_trade(side: str, sl: float, tp: float, setup: str, thesis: str, risk_mu
         return {"ok": False, "error": f"spread_{spread_px:.2f}_exceeds_{c['max_spread_r']}R_of_stop_{dist:.2f}"}
     return _execute(c, state, s, snap, acct, now, nw, side, sl, tp, "ai-" + setup, sid, risk_mult,
                     {"thesis": thesis.strip()[:200], "ai": True})
+
+
+def _open_playbook(c, state, s, snap, acct, now, nw, side, setup, thesis, risk_mult):
+    """Playbook entry. Stop, target, size cap, hold length and management come from the active signal (your sl/tp are
+    ignored): the trade is exactly the one that was backtested. `pyramid` adds to a winning runner (tier extreme)."""
+    tick = snap["tick"]
+    entry = tick.ask if side == "buy" else tick.bid
+    extra = {"thesis": thesis.strip()[:200], "ai": True, "tier": c["tier"], "mgmt": "runner"}
+    if setup == "pyramid":
+        px = tick.bid if side == "buy" else tick.ask
+        for p in _positions(c):
+            rec = state["positions"].get(str(p.ticket), {})
+            if rec.get("mgmt") != "runner" or rec.get("strategy") == "pyramid" or rec.get("side") != side:
+                continue
+            add = pb.add_ok(c["tier"], side, rec["entry"], p.sl, px, rec["r_dist"], rec.get("adds", 0))
+            if not add:
+                continue
+            dist = abs(entry - add["sl"])
+            if dist <= 0 or (side == "buy" and add["sl"] >= entry) or (side == "sell" and add["sl"] <= entry):
+                continue
+            tp = entry + pb.TP_R * dist if side == "buy" else entry - pb.TP_R * dist
+            extra.update(strategy="pyramid", time_stop_ts=rec.get("time_stop_ts"))
+            res = _execute(c, state, s, snap, acct, now, nw, side, add["sl"], tp, "ai-pyramid",
+                           f"pb-pyramid-{p.ticket}-{rec.get('adds', 0) + 1}", min(risk_mult, add["risk_mult"]), extra)
+            if res.get("ok"):
+                rec["adds"] = rec.get("adds", 0) + 1
+                save_state(state)
+            return res
+        return {"ok": False, "error": "no_position_eligible_for_pyramid (tier extreme, parent >= +1.5R, stop at break-even)"}
+    sig = next((x for x in snap.get("playbook", []) if x["strategy"] == setup and x["side"] == side), None)
+    if sig is None:
+        return {"ok": False, "error": "no_active_playbook_signal",
+                "active": [f"{x['strategy']}:{x['side']}" for x in snap.get("playbook", [])]}
+    if sig["id"] in state.get("pb_done", []):
+        return {"ok": False, "error": "playbook_signal_already_traded"}
+    rs = pb.resolve(sig, entry, c["tier"], risk_mult)
+    if not rs["ok"]:
+        return rs
+    left, need = _run_left_s(state, c, now.timestamp()), sig["time_stop_ts"] - now.timestamp()
+    if left is not None and need > left:
+        return {"ok": False, "error": f"run_ends_before_time_stop (needs {need / 60:.0f} min, run has {left / 60:.0f} min left): "
+                                      "the run-cap flatten would cut the hold short; use /desk-max or skip"}
+    extra.update(strategy=setup, time_stop_ts=sig["time_stop_ts"],
+                 cost_r=round(pb.cost_r(tick.ask - tick.bid, rs["sl_dist"]), 3))
+    res = _execute(c, state, s, snap, acct, now, nw, side, rs["sl"], rs["tp"], "ai-" + setup, sig["id"],
+                   rs["risk_mult"], extra)
+    if res.get("ok"):
+        state["pb_done"] = (state.get("pb_done", []) + [sig["id"]])[-60:]
+        save_state(state)
+    return res
 
 
 @mcp.tool()
@@ -941,6 +1142,13 @@ def account_info() -> dict:
     d = a._asdict() if a else {}
     d["terminal_trade_allowed"] = t.trade_allowed if t else None
     d["is_demo"] = bool(a) and a.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
+    sym = cfg()["symbol"]
+    tick = mt5.symbol_info_tick(sym) if mt5.symbol_select(sym, True) else None
+    if tick is not None:
+        _tick_ts(tick)  # lets a live tick set the broker-offset detector
+    off = _bt_state()["off"]
+    d["symbol"], d["symbol_found"] = sym, tick is not None
+    d["utc_offset_h"], d["utc_offset_known"] = (off or 0) / 3600, off is not None
     return d
 
 
@@ -954,7 +1162,7 @@ def get_price(symbol: str) -> dict:
     info = mt5.symbol_info(symbol)
     return {"symbol": symbol, "bid": tick.bid, "ask": tick.ask, "spread_points": info.spread,
             "volume_min": info.volume_min, "volume_step": info.volume_step,
-            "time": datetime.fromtimestamp(tick.time).isoformat()}
+            "time": datetime.fromtimestamp(_tick_ts(tick)).isoformat()}
 
 
 @mcp.tool()
@@ -971,7 +1179,7 @@ def get_rates(symbol: str, timeframe: str = "H1", count: int = 50) -> list[dict]
     tf = getattr(mt5, f"TIMEFRAME_{timeframe.upper()}", None)
     if tf is None:
         raise ValueError("bad timeframe")
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, min(count, 500))
+    rates = _bars(symbol, tf, min(count, 500))
     if rates is None:
         return []
     return [{"time": datetime.fromtimestamp(int(r["time"])).isoformat(), "open": float(r["open"]),

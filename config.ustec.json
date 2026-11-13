@@ -29,7 +29,7 @@
   "calendar_max_age_h": 12,
   "calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
   "live_enabled": false,
-  "run_max_minutes": 240,
+  "run_max_minutes": 480,
   "run_gap_new_s": 4000,
   "no_entry_last_min": 10,
   "no_entry_before_break_min": 25,
